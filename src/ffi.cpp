@@ -267,6 +267,37 @@ bool add_sensitive_inode(uint64_t inode, uint32_t category) {
     return false;
 }
 
+bool add_protected_static_inode(uint64_t inode) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->AddProtectedStaticInode(inode);
+    }
+#endif
+    return false;
+}
+
+bool add_bypassed_directory_inode(uint64_t inode) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->AddBypassedDirectoryInode(inode);
+    }
+#endif
+    return false;
+}
+
+bool remove_bypassed_directory_inode(uint64_t inode) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->RemoveBypassedDirectoryInode(inode);
+    }
+#endif
+    return false;
+}
+
+
 bool add_trusted_exec_inode(uint64_t inode, uint32_t trust_level) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
@@ -304,6 +335,26 @@ bool update_process_threshold(uint32_t pid, uint64_t start_time, uint32_t thresh
 #if defined(TARGET_OS_LINUX)
     if (g_loader && g_running) {
         return g_loader->UpdateMapEntry(kinnector::lnx::BpfMapType::ProcessThreshold, pid, start_time, threshold);
+    }
+#endif
+    return false;
+}
+
+bool update_map_entry(int map_type, uint32_t pid, uint64_t start_time, uint32_t value) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->UpdateMapEntry(static_cast<kinnector::lnx::BpfMapType>(map_type), pid, start_time, value);
+    }
+#endif
+    return false;
+}
+
+bool delete_map_entry(int map_type, uint32_t pid, uint64_t start_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->DeleteMapEntry(static_cast<kinnector::lnx::BpfMapType>(map_type), pid, start_time);
     }
 #endif
     return false;

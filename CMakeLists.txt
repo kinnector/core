@@ -48,8 +48,17 @@ else()
     message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}")
 endif()
 
-add_library(kinnector-core SHARED ${CORE_SOURCES})
+add_library(kinnector-core STATIC ${CORE_SOURCES})
+set_target_properties(kinnector-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(kinnector-core-shared SHARED ${CORE_SOURCES})
+set_target_properties(kinnector-core-shared PROPERTIES 
+    OUTPUT_NAME kinnector-core
+    POSITION_INDEPENDENT_CODE ON
+)
+
 target_include_directories(kinnector-core PUBLIC include)
+target_include_directories(kinnector-core-shared PUBLIC include)
 
 # Target-specific properties and link libraries
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -58,13 +67,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     pkg_check_modules(LIBBPF REQUIRED libbpf)
     target_link_libraries(kinnector-core PRIVATE ${LIBBPF_LIBRARIES} pthread)
     target_include_directories(kinnector-core PRIVATE ${LIBBPF_INCLUDE_DIRS})
+    target_link_libraries(kinnector-core-shared PRIVATE ${LIBBPF_LIBRARIES} pthread)
+    target_include_directories(kinnector-core-shared PRIVATE ${LIBBPF_INCLUDE_DIRS})
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     # Link libraries for Windows ETW and IPC
-    target_link_libraries(kinnector-core PRIVATE
-        advapi32
-        ole32
-        tdh
-    )
+    target_link_libraries(kinnector-core PRIVATE advapi32 ole32 tdh)
+    target_link_libraries(kinnector-core-shared PRIVATE advapi32 ole32 tdh)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     # Link frameworks for macOS
     target_link_libraries(kinnector-core PRIVATE
@@ -72,7 +80,13 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         "-framework Foundation"
         "-framework Security"
     )
+    target_link_libraries(kinnector-core-shared PRIVATE
+        "-framework EndpointSecurity"
+        "-framework Foundation"
+        "-framework Security"
+    )
 endif()
+
 
 # Generate vmlinux.h from BTF
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -98,6 +112,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         )
         add_custom_target(ebpf_target DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/kinnector.bpf.o)
         add_dependencies(kinnector-core ebpf_target)
+        add_dependencies(kinnector-core-shared ebpf_target)
     endif()
     # Add test executable
     add_executable(kinnector-test-ipc src/linux/test_ipc.cpp)

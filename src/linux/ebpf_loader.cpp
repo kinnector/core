@@ -17,6 +17,37 @@ struct process_key {
 
 namespace kinnector::lnx {
 
+static struct bpf_link* AttachOrUpdatePinnedLink(struct bpf_object* bpf_obj, const char* prog_name, const char* pin_path) {
+    struct bpf_program* prog = bpf_object__find_program_by_name(bpf_obj, prog_name);
+    if (!prog) return nullptr;
+
+    struct bpf_link* link = nullptr;
+    if (access(pin_path, F_OK) == 0) {
+        link = bpf_link__open(pin_path);
+        if (link) {
+            int ret = bpf_link_update(bpf_link__fd(link), bpf_program__fd(prog), nullptr);
+            if (ret == 0) {
+                std::cout << "[BPF Link] Successfully updated pinned link in-place: " << pin_path << std::endl;
+                return link;
+            }
+            std::cerr << "[BPF Link] Failed to update pinned link in-place: " << pin_path << ". Re-creating." << std::endl;
+            bpf_link__destroy(link);
+            unlink(pin_path);
+        }
+    }
+
+    link = bpf_program__attach(prog);
+    if (link) {
+        int ret = bpf_link__pin(link, pin_path);
+        if (ret == 0) {
+            std::cout << "[BPF Link] Successfully attached and pinned: " << pin_path << std::endl;
+        } else {
+            std::cerr << "[BPF Link] Failed to pin link to " << pin_path << ": " << std::strerror(-ret) << std::endl;
+        }
+    }
+    return link;
+}
+
 EbpfLoader::EbpfLoader() = default;
 
 EbpfLoader::~EbpfLoader() {
@@ -112,16 +143,13 @@ bool EbpfLoader::Start() {
             }
         }
 
-        // Attach TTY/PTY hooks
-        struct bpf_program *prog;
-        prog = bpf_object__find_program_by_name(bpf_obj_, "kprobe_tty_write");
-        if (prog) kprobe_tty_write_link_ = bpf_program__attach(prog);
+        // Attach TTY/PTY hooks with pinning for zero-downtime hot-reloading
+        mkdir("/sys/fs/bpf", 0755);
+        mkdir("/sys/fs/bpf/warden", 0755);
 
-        prog = bpf_object__find_program_by_name(bpf_obj_, "kprobe_tty_read");
-        if (prog) kprobe_tty_read_link_ = bpf_program__attach(prog);
-
-        prog = bpf_object__find_program_by_name(bpf_obj_, "kretprobe_tty_read");
-        if (prog) kretprobe_tty_read_link_ = bpf_program__attach(prog);
+        kprobe_tty_write_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "kprobe_tty_write", "/sys/fs/bpf/warden/kprobe_tty_write");
+        kprobe_tty_read_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "kprobe_tty_read", "/sys/fs/bpf/warden/kprobe_tty_read");
+        kretprobe_tty_read_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "kretprobe_tty_read", "/sys/fs/bpf/warden/kretprobe_tty_read");
 
         ring_buffer_thread_ = std::thread(&EbpfLoader::RingBufferPollLoop, this);
     }
@@ -140,25 +168,38 @@ void EbpfLoader::Stop() {
         ring_buffer__free(ring_buf_);
         ring_buf_ = nullptr;
     }
+    
+    // For pinned links: disconnect them so they persist in the kernel, then destroy the structure
+    auto CleanPinnedLink = [](struct bpf_link*& link) {
+        if (link) {
+            bpf_link__disconnect(link);
+            bpf_link__destroy(link);
+            link = nullptr;
+        }
+    };
 
-    if (file_open_link_)       bpf_link__destroy(file_open_link_);
-    if (socket_connect_link_)  bpf_link__destroy(socket_connect_link_);
-    if (socket_listen_link_)   bpf_link__destroy(socket_listen_link_);
-    if (exec_link_)            bpf_link__destroy(exec_link_);
-    if (ptrace_link_)          bpf_link__destroy(ptrace_link_);
-    if (kprobe_tty_write_link_) bpf_link__destroy(kprobe_tty_write_link_);
-    if (kprobe_tty_read_link_)  bpf_link__destroy(kprobe_tty_read_link_);
-    if (kretprobe_tty_read_link_) bpf_link__destroy(kretprobe_tty_read_link_);
-    if (mprotect_link_)        bpf_link__destroy(mprotect_link_);
-    if (tp_exec_link_)         bpf_link__destroy(tp_exec_link_);
-    if (tp_connect_link_)      bpf_link__destroy(tp_connect_link_);
-    if (tp_exit_link_)         bpf_link__destroy(tp_exit_link_);
-    if (tp_openat_link_)       bpf_link__destroy(tp_openat_link_);
-    if (tp_mmap_link_)         bpf_link__destroy(tp_mmap_link_);
-    if (tp_mprotect_link_)     bpf_link__destroy(tp_mprotect_link_);
-    if (tp_dup2_link_)         bpf_link__destroy(tp_dup2_link_);
-    if (tp_dup3_link_)         bpf_link__destroy(tp_dup3_link_);
-    if (tp_listen_link_)       bpf_link__destroy(tp_listen_link_);
+    CleanPinnedLink(file_open_link_);
+    CleanPinnedLink(socket_connect_link_);
+    CleanPinnedLink(socket_listen_link_);
+    CleanPinnedLink(exec_link_);
+    CleanPinnedLink(ptrace_link_);
+    CleanPinnedLink(kprobe_tty_write_link_);
+    CleanPinnedLink(kprobe_tty_read_link_);
+    CleanPinnedLink(kretprobe_tty_read_link_);
+    CleanPinnedLink(mprotect_link_);
+    CleanPinnedLink(task_kill_link_);
+    CleanPinnedLink(path_chmod_link_);
+
+    // Fallback tracepoints are not pinned, so we can destroy them normally
+    if (tp_exec_link_)         { bpf_link__destroy(tp_exec_link_); tp_exec_link_ = nullptr; }
+    if (tp_connect_link_)      { bpf_link__destroy(tp_connect_link_); tp_connect_link_ = nullptr; }
+    if (tp_exit_link_)         { bpf_link__destroy(tp_exit_link_); tp_exit_link_ = nullptr; }
+    if (tp_openat_link_)       { bpf_link__destroy(tp_openat_link_); tp_openat_link_ = nullptr; }
+    if (tp_mmap_link_)         { bpf_link__destroy(tp_mmap_link_); tp_mmap_link_ = nullptr; }
+    if (tp_mprotect_link_)     { bpf_link__destroy(tp_mprotect_link_); tp_mprotect_link_ = nullptr; }
+    if (tp_dup2_link_)         { bpf_link__destroy(tp_dup2_link_); tp_dup2_link_ = nullptr; }
+    if (tp_dup3_link_)         { bpf_link__destroy(tp_dup3_link_); tp_dup3_link_ = nullptr; }
+    if (tp_listen_link_)       { bpf_link__destroy(tp_listen_link_); tp_listen_link_ = nullptr; }
 
 
     file_open_link_      = nullptr;
@@ -170,6 +211,8 @@ void EbpfLoader::Stop() {
     kprobe_tty_read_link_  = nullptr;
     kretprobe_tty_read_link_ = nullptr;
     mprotect_link_       = nullptr;
+    task_kill_link_      = nullptr;
+    path_chmod_link_     = nullptr;
     tp_exec_link_        = nullptr;
     tp_connect_link_     = nullptr;
     tp_exit_link_        = nullptr;
@@ -210,28 +253,21 @@ bool EbpfLoader::LoadAndAttachLsm() {
         return false;
     }
 
-    // Attach LSM hooks
-    prog = bpf_object__find_program_by_name(bpf_obj_, "file_open");
-    if (prog) file_open_link_ = bpf_program__attach(prog);
+    // Attach LSM hooks with pinning for zero-downtime hot-reloading
+    mkdir("/sys/fs/bpf", 0755);
+    mkdir("/sys/fs/bpf/warden", 0755);
 
-    prog = bpf_object__find_program_by_name(bpf_obj_, "socket_connect");
-    if (prog) socket_connect_link_ = bpf_program__attach(prog);
-
-    prog = bpf_object__find_program_by_name(bpf_obj_, "socket_listen");
-    if (prog) socket_listen_link_ = bpf_program__attach(prog);
-
-    prog = bpf_object__find_program_by_name(bpf_obj_, "bprm_creds_for_exec");
-    if (prog) exec_link_ = bpf_program__attach(prog);
-
-    prog = bpf_object__find_program_by_name(bpf_obj_, "ptrace_access_check");
-    if (prog) ptrace_link_ = bpf_program__attach(prog);
-
-    prog = bpf_object__find_program_by_name(bpf_obj_, "file_mprotect");
-    if (prog) mprotect_link_ = bpf_program__attach(prog);
+    file_open_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "file_open", "/sys/fs/bpf/warden/file_open");
+    socket_connect_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "socket_connect", "/sys/fs/bpf/warden/socket_connect");
+    socket_listen_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "socket_listen", "/sys/fs/bpf/warden/socket_listen");
+    exec_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "bprm_creds_for_exec", "/sys/fs/bpf/warden/bprm_creds_for_exec");
+    ptrace_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "ptrace_access_check", "/sys/fs/bpf/warden/ptrace_access_check");
+    mprotect_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "file_mprotect", "/sys/fs/bpf/warden/file_mprotect");
+    task_kill_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "task_kill", "/sys/fs/bpf/warden/task_kill");
+    path_chmod_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "path_chmod", "/sys/fs/bpf/warden/path_chmod");
 
     // P2-8: Attach file_permission for FileWrite events
-    prog = bpf_object__find_program_by_name(bpf_obj_, "file_permission");
-    if (prog) bpf_program__attach(prog); // Intentionally not stored; fire-and-forget for write detection
+    AttachOrUpdatePinnedLink(bpf_obj_, "file_permission", "/sys/fs/bpf/warden/file_permission");
 
     // Q-06 fix: validate exec_link_ is attached before reporting success
     return file_open_link_ && socket_connect_link_ && exec_link_;
@@ -303,14 +339,42 @@ bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         case BpfMapType::TrustedRoots: map_name = "trusted_ancestor_roots"; break;
         case BpfMapType::TaintedProcess: map_name = "tainted_process_map"; break;
         case BpfMapType::ProcessThreshold: map_name = "process_threshold_map"; break;
+        case BpfMapType::PidTreeType: map_name = "pid_tree_type_map"; break;
+        case BpfMapType::JvmExceptionPids: map_name = "jvm_exception_pids"; break;
+        case BpfMapType::DbOutboundAllowlist: map_name = "db_outbound_allowlist"; break;
+        case BpfMapType::InfraOutboundAllowlist: map_name = "infra_outbound_allowlist"; break;
+        case BpfMapType::ExecAllowlistMap: map_name = "exec_allowlist_map"; break;
+        case BpfMapType::AdminSessionPids: map_name = "admin_session_pids"; break;
+        case BpfMapType::TrustedAdminBinaries: map_name = "trusted_admin_binaries"; break;
         default: return false;
     }
 
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, map_name);
     if (!map) return false;
 
-    struct process_key key = { pid, start_time };
     int fd = bpf_map__fd(map);
+    
+    // For maps that key on pid (uint32_t) rather than process_key
+    if (map_type == BpfMapType::PidTreeType) {
+        uint32_t val = value;
+        return bpf_map_update_elem(fd, &pid, &val, BPF_ANY) == 0;
+    } else if (map_type == BpfMapType::JvmExceptionPids || map_type == BpfMapType::AdminSessionPids) {
+        uint8_t val8 = static_cast<uint8_t>(value);
+        return bpf_map_update_elem(fd, &pid, &val8, BPF_ANY) == 0;
+    } else if (map_type == BpfMapType::DbOutboundAllowlist || map_type == BpfMapType::InfraOutboundAllowlist) {
+        struct {
+            uint32_t pid;
+            uint32_t ip;
+        } __attribute__((packed)) key = { pid, static_cast<uint32_t>(start_time) };
+        uint8_t val8 = static_cast<uint8_t>(value);
+        return bpf_map_update_elem(fd, &key, &val8, BPF_ANY) == 0;
+    } else if (map_type == BpfMapType::ExecAllowlistMap || map_type == BpfMapType::TrustedAdminBinaries) {
+        uint64_t key = start_time;
+        uint8_t val8 = static_cast<uint8_t>(value);
+        return bpf_map_update_elem(fd, &key, &val8, BPF_ANY) == 0;
+    }
+
+    struct process_key key = { pid, start_time };
     
     // For TrustedRoots, map holds uint8_t, others hold uint32_t
     if (map_type == BpfMapType::TrustedRoots) {
@@ -334,14 +398,35 @@ bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         case BpfMapType::TrustedRoots: map_name = "trusted_ancestor_roots"; break;
         case BpfMapType::TaintedProcess: map_name = "tainted_process_map"; break;
         case BpfMapType::ProcessThreshold: map_name = "process_threshold_map"; break;
+        case BpfMapType::PidTreeType: map_name = "pid_tree_type_map"; break;
+        case BpfMapType::JvmExceptionPids: map_name = "jvm_exception_pids"; break;
+        case BpfMapType::DbOutboundAllowlist: map_name = "db_outbound_allowlist"; break;
+        case BpfMapType::InfraOutboundAllowlist: map_name = "infra_outbound_allowlist"; break;
+        case BpfMapType::ExecAllowlistMap: map_name = "exec_allowlist_map"; break;
+        case BpfMapType::AdminSessionPids: map_name = "admin_session_pids"; break;
+        case BpfMapType::TrustedAdminBinaries: map_name = "trusted_admin_binaries"; break;
         default: return false;
     }
 
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, map_name);
     if (!map) return false;
 
-    struct process_key key = { pid, start_time };
-    return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
+    int fd = bpf_map__fd(map);
+    if (map_type == BpfMapType::PidTreeType || map_type == BpfMapType::JvmExceptionPids || map_type == BpfMapType::AdminSessionPids) {
+        return bpf_map_delete_elem(fd, &pid) == 0;
+    } else if (map_type == BpfMapType::DbOutboundAllowlist || map_type == BpfMapType::InfraOutboundAllowlist) {
+        struct {
+            uint32_t pid;
+            uint32_t ip;
+        } __attribute__((packed)) key = { pid, static_cast<uint32_t>(start_time) };
+        return bpf_map_delete_elem(fd, &key) == 0;
+    } else if (map_type == BpfMapType::ExecAllowlistMap || map_type == BpfMapType::TrustedAdminBinaries) {
+        uint64_t key = start_time;
+        return bpf_map_delete_elem(fd, &key) == 0;
+    } else {
+        struct process_key key = { pid, start_time };
+        return bpf_map_delete_elem(fd, &key) == 0;
+    }
 }
 
 bool EbpfLoader::AddSensitiveInode(uint64_t inode, uint32_t category) {
@@ -354,6 +439,19 @@ bool EbpfLoader::AddSensitiveInode(uint64_t inode, uint32_t category) {
     if (!map) return false;
 
     return bpf_map_update_elem(bpf_map__fd(map), &inode, &category, BPF_ANY) == 0;
+}
+
+bool EbpfLoader::AddProtectedStaticInode(uint64_t inode) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "protected_static_inodes");
+    if (!map) return false;
+
+    uint8_t val = 1;
+    return bpf_map_update_elem(bpf_map__fd(map), &inode, &val, BPF_ANY) == 0;
 }
 
 bool EbpfLoader::AddTrustedExecInode(uint64_t inode, uint32_t trust_level) {
@@ -393,6 +491,32 @@ bool EbpfLoader::SetConfigValue(uint32_t index, uint32_t value) {
 
     return bpf_map_update_elem(bpf_map__fd(map), &index, &value, BPF_ANY) == 0;
 }
+
+bool EbpfLoader::AddBypassedDirectoryInode(uint64_t inode) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "bypassed_directories");
+    if (!map) return false;
+
+    uint8_t val = 1;
+    return bpf_map_update_elem(bpf_map__fd(map), &inode, &val, BPF_ANY) == 0;
+}
+
+bool EbpfLoader::RemoveBypassedDirectoryInode(uint64_t inode) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "bypassed_directories");
+    if (!map) return false;
+
+    return bpf_map_delete_elem(bpf_map__fd(map), &inode) == 0;
+}
+
 
 void EbpfLoader::SetTtyEventCallback(TtyEventCallback cb) {
     tty_event_callback_ = cb;

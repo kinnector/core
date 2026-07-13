@@ -130,6 +130,27 @@ struct TelemetryEvent {
 #define EACCES 13
 #endif
 
+#ifndef EPERM
+#define EPERM 1
+#endif
+
+// Role flag: set in process_threshold_map value for known database processes
+#define ROLE_DATABASE 0x80000000u
+
+#define PROFILE_ZERO_EXECUTION     0x10000000u
+#define PROFILE_RESTRICTED_EXEC    0x20000000u
+#define PROFILE_SHELL_ENABLED      0x40000000u
+#define PROFILE_ZERO_NETWORK       0x80000000u
+#define PROFILE_PATH_CONSTRAINED   0x01000000u
+
+#define ROLE_MAIL_GATEWAY          0x02000000u
+#define ROLE_QUEUE_MANAGER         0x04000000u
+#define ROLE_NTP_CLIENT            0x08000000u
+
+#define TREE_ADMIN_SESSION         0x00010000u
+#define TREE_TRUSTED_ADMIN         0x00020000u
+#define TREE_AUTOMATION            0x00040000u
+
 // ---------------------------------------------------------------------------
 // BPF Maps
 // ---------------------------------------------------------------------------
@@ -182,10 +203,16 @@ struct {
     __type(value, uint32_t);
 } process_threshold_map SEC(".maps");
 
-// Map: Config Key (0 = blocking_enabled) -> Value
+// Map: Config Key (0 = blocking_enabled, 1 = sshd_uid) -> Value
+#define CONFIG_BLOCKING_ENABLED 0
+#define CONFIG_SSHD_UID          1
+#define CONFIG_HOST_MNT_NS       2
+#define CONFIG_HOST_PID_NS       3
+#define CONFIG_HOST_NET_NS       4
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 10);
     __type(key, uint32_t);
     __type(value, uint32_t);
 } config_map SEC(".maps");
@@ -197,6 +224,95 @@ struct {
     __type(key, struct process_key);
     __type(value, uint32_t);
 } tainted_process_map SEC(".maps");
+
+// Map: directory inode -> 1 (bypass telemetry for DB data dirs).
+// Only honoured for processes with ROLE_DATABASE set in process_threshold_map.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, uint64_t);   // directory inode number
+    __type(value, uint8_t);  // 1 = bypass
+} bypassed_directories SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, uint32_t);
+    __type(value, uint32_t);
+} pid_tree_type_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, uint32_t);
+    __type(value, uint8_t);
+} jvm_exception_pids SEC(".maps");
+
+struct db_allowlist_key {
+    uint32_t pid;
+    uint32_t ip;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, struct db_allowlist_key);
+    __type(value, uint8_t);
+} db_outbound_allowlist SEC(".maps");
+
+struct infra_allowlist_key {
+    uint32_t pid;
+    uint32_t ip;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, struct infra_allowlist_key);
+    __type(value, uint8_t);
+} infra_outbound_allowlist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, uint64_t);
+    __type(value, uint8_t);
+} exec_allowlist_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 128);
+    __type(key, uint64_t);
+    __type(value, uint8_t);
+} trusted_admin_binaries SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, uint32_t);
+    __type(value, uint8_t);
+} admin_session_pids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, uint64_t);
+    __type(value, uint8_t);
+} newly_created_inodes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, uint64_t);
+    __type(value, uint8_t);
+} protected_static_inodes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, uint32_t);
+    __type(value, uint8_t);
+} env_read_count_map SEC(".maps");
 
 // P2-9: Per-CPU atomic sequence counter for event ordering
 struct {
@@ -244,6 +360,77 @@ struct {
 // Helpers
 // ---------------------------------------------------------------------------
 
+static __always_inline bool is_env_file(const char *name) {
+    #pragma unroll
+    for (int i = 0; i < 28; i++) {
+        if (name[i] == '.' && name[i+1] == 'e' && name[i+2] == 'n' && name[i+3] == 'v') {
+            return true;
+        }
+        if (name[i] == '\0') break;
+    }
+    return false;
+}
+
+static __always_inline bool is_git_file(const char *name) {
+    #pragma unroll
+    for (int i = 0; i < 28; i++) {
+        if (name[i] == '.' && name[i+1] == 'g' && name[i+2] == 'i' && name[i+3] == 't') {
+            return true;
+        }
+        if (name[i] == '\0') break;
+    }
+    return false;
+}
+static __always_inline bool is_private_ip(uint32_t ip_be) {
+    uint32_t ip = __builtin_bswap32(ip_be);
+    if ((ip & 0xFF000000) == 0x7F000000) return true;
+    if ((ip & 0xFF000000) == 0x0A000000) return true;
+    if ((ip & 0xFFF00000) == 0xAC100000) return true;
+    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
+    return false;
+}
+
+static __always_inline uint32_t get_current_mnt_ns_inum() {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+    struct nsproxy *nsproxy = BPF_CORE_READ(task, nsproxy);
+    if (!nsproxy) return 0;
+    struct mnt_namespace *mnt_ns = BPF_CORE_READ(nsproxy, mnt_ns);
+    if (!mnt_ns) return 0;
+    return BPF_CORE_READ(mnt_ns, ns.inum);
+}
+
+static __always_inline uint32_t get_current_pid_ns_inum() {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+    struct pid *pid = BPF_CORE_READ(task, thread_pid);
+    if (!pid) return 0;
+    unsigned int level = BPF_CORE_READ(pid, level);
+    if (level > 4) return 0;
+    struct pid_namespace *pid_ns = BPF_CORE_READ(pid, numbers[level].ns);
+    if (!pid_ns) return 0;
+    return BPF_CORE_READ(pid_ns, ns.inum);
+}
+
+static __always_inline uint32_t get_current_net_ns_inum() {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+    struct nsproxy *nsproxy = BPF_CORE_READ(task, nsproxy);
+    if (!nsproxy) return 0;
+    struct net *net = BPF_CORE_READ(nsproxy, net_ns);
+    if (!net) return 0;
+    return BPF_CORE_READ(net, ns.inum);
+}
+static __always_inline int is_admin_session() {
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
+    if (tree_type && (*tree_type & TREE_ADMIN_SESSION)) {
+        return 1;
+    }
+    return 0;
+}
+
 static __always_inline struct process_key get_current_process_key() {
     struct process_key key = {0};
     uint64_t pid_tgid = bpf_get_current_pid_tgid();
@@ -288,6 +475,91 @@ int BPF_PROG(file_open, struct file *file, int mask) {
 
     struct process_key key = get_current_process_key();
 
+    // SSHD Pre-Auth Zero-Trust Lockdown:
+    // If the process is running under the unprivileged sshd user's UID,
+    // deny reading files in sensitive folders (home, root, www, opt, srv, etc.).
+    uint32_t current_uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    uint32_t sshd_uid_key = CONFIG_SSHD_UID;
+    uint32_t *sshd_uid = bpf_map_lookup_elem(&config_map, &sshd_uid_key);
+    if (sshd_uid && *sshd_uid > 0 && current_uid == *sshd_uid) {
+        struct path f_path = BPF_CORE_READ(file, f_path);
+        struct dentry *dentry = f_path.dentry;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            if (!dentry) break;
+            struct qstr d_name = BPF_CORE_READ(dentry, d_name);
+            char name[16] = {0};
+            bpf_probe_read_kernel_str(name, sizeof(name), d_name.name);
+            if (name[0] == 'h' && name[1] == 'o' && name[2] == 'm' && name[3] == 'e' && name[4] == '\0') {
+                return -EACCES;
+            }
+            if (name[0] == 'r' && name[1] == 'o' && name[2] == 'o' && name[3] == 't' && name[4] == '\0') {
+                return -EACCES;
+            }
+            if (name[0] == 'w' && name[1] == 'w' && name[2] == 'w' && name[3] == '\0') {
+                return -EACCES;
+            }
+            if (name[0] == 'o' && name[1] == 'p' && name[2] == 't' && name[3] == '\0') {
+                return -EACCES;
+            }
+            if (name[0] == 's' && name[1] == 'r' && name[2] == 'v' && name[3] == '\0') {
+                return -EACCES;
+            }
+            dentry = BPF_CORE_READ(dentry, d_parent);
+        }
+    }
+
+    // Admin Session Hook: Allow everything EXCEPT dynamic library injection attempts (.so from writable dirs)
+    if (is_admin_session()) {
+        struct path f_path = BPF_CORE_READ(file, f_path);
+        struct dentry *dentry = f_path.dentry;
+        if (dentry) {
+            struct qstr d_name = BPF_CORE_READ(dentry, d_name);
+            char filename[64] = {0};
+            bpf_probe_read_kernel_str(filename, sizeof(filename), d_name.name);
+
+            // Check if filename contains ".so"
+            bool is_library = false;
+            #pragma unroll
+            for (int i = 0; i < 58; i++) {
+                if (filename[i] == '.' && filename[i+1] == 's' && filename[i+2] == 'o') {
+                    is_library = true;
+                    break;
+                }
+                if (filename[i] == '\0') {
+                    break;
+                }
+            }
+
+            if (is_library) {
+                // Check if directory path is outside /usr/lib, /lib, /usr/local/lib
+                // Walk up parents to see if any parent is user-writable (e.g. "tmp", "home", "var")
+                struct dentry *curr = dentry;
+                bool is_unauthorized_path = false;
+                #pragma unroll
+                for (int i = 0; i < 6; i++) {
+                    curr = BPF_CORE_READ(curr, d_parent);
+                    if (!curr) break;
+                    struct qstr p_name = BPF_CORE_READ(curr, d_name);
+                    char p_str[16] = {0};
+                    bpf_probe_read_kernel_str(p_str, sizeof(p_str), p_name.name);
+                    if ((p_str[0] == 't' && p_str[1] == 'm' && p_str[2] == 'p' && p_str[3] == '\0') ||
+                        (p_str[0] == 'h' && p_str[1] == 'o' && p_str[2] == 'm' && p_str[3] == 'e' && p_str[4] == '\0') ||
+                        (p_str[0] == 'u' && p_str[1] == 's' && p_str[2] == 'e' && p_str[3] == 'r' && p_str[4] == '\0') ||
+                        (p_str[0] == 'd' && p_str[1] == 'e' && p_str[2] == 'v' && p_str[3] == '\0') ||
+                        (p_str[0] == 'm' && p_str[1] == 'n' && p_str[2] == 't' && p_str[3] == '\0')) {
+                        is_unauthorized_path = true;
+                        break;
+                    }
+                }
+                if (is_unauthorized_path) {
+                    return -EACCES; // Block library injection!
+                }
+            }
+        }
+        return 0; // Admin session is completely bypassed for non-injected files!
+    }
+
     // Check if the process is absolutely trusted
     uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
     if (trusted && *trusted == 1)
@@ -297,6 +569,65 @@ int BPF_PROG(file_open, struct file *file, int mask) {
     uint32_t config_idx = 0;
     uint32_t *mode = bpf_map_lookup_elem(&config_map, &config_idx);
     uint32_t blocking_enabled = (mode && *mode == 1);
+
+    if (blocking_enabled) {
+        struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+        if (dentry) {
+            struct qstr d_name = BPF_CORE_READ(dentry, d_name);
+            char filename[64] = {0};
+            bpf_probe_read_kernel_str(filename, sizeof(filename), d_name.name);
+
+            // Rule 2: UNIX Socket Protection
+            if ((filename[0] == 'd' && filename[1] == 'o' && filename[2] == 'c' && filename[3] == 'k' && filename[4] == 'e' && filename[5] == 'r' && filename[6] == '.' && filename[7] == 's' && filename[8] == 'o' && filename[9] == 'c' && filename[10] == 'k') ||
+                (filename[0] == 'c' && filename[1] == 'o' && filename[2] == 'n' && filename[3] == 't' && filename[4] == 'a' && filename[5] == 'i' && filename[6] == 'n' && filename[7] == 'e' && filename[8] == 'r' && filename[9] == 'd' && filename[10] == '.' && filename[11] == 's' && filename[12] == 'o' && filename[13] == 'c' && filename[14] == 'k')) {
+                return -EACCES;
+            }
+
+            // Rule 3: Container Escape Block
+            uint32_t host_mnt_ns_idx = CONFIG_HOST_MNT_NS;
+            uint32_t *host_mnt_ns = bpf_map_lookup_elem(&config_map, &host_mnt_ns_idx);
+            if (host_mnt_ns && *host_mnt_ns > 0) {
+                uint32_t current_mnt_ns = get_current_mnt_ns_inum();
+                if (current_mnt_ns != *host_mnt_ns) {
+                    if (mask & 0x0002) { // Opening for write
+                        if ((filename[0] == 'r' && filename[1] == 'u' && filename[2] == 'n' && filename[3] == 'c' && filename[4] == '\0') ||
+                            (filename[0] == 'c' && filename[1] == 'o' && filename[2] == 'n' && filename[3] == 't' && filename[4] == 'a' && filename[5] == 'i' && filename[6] == 'n' && filename[7] == 'e' && filename[8] == 'r' && filename[9] == 'd' && filename[10] == '-' && filename[11] == 's' && filename[12] == 'h' && filename[13] == 'i' && filename[14] == 'm' && filename[15] == '\0')) {
+                            return -EACCES; // Block escape write!
+                        }
+                    }
+                }
+            }
+
+            uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+            if (threshold && *threshold > 0) {
+                // 1. Block .git reads unconditionally for all monitored processes (including daemon and forks)
+                if (is_git_file(filename)) {
+                    return -EACCES;
+                }
+
+                // 2. Block spawned subprocesses (untrusted) from reading .env*
+                if (*threshold == 1) {
+                    if (is_env_file(filename)) {
+                        return -EACCES;
+                    }
+                }
+
+                // 2. Persistent Boot-Read Rule: allow reading .env exactly once during bootstrap
+                if (is_env_file(filename)) {
+                    uint32_t pid = key.pid;
+                    uint8_t *count = bpf_map_lookup_elem(&env_read_count_map, &pid);
+                    if (count) {
+                        if (*count >= 1) {
+                            return -EACCES;
+                        }
+                    } else {
+                        uint8_t one = 1;
+                        bpf_map_update_elem(&env_read_count_map, &pid, &one, BPF_ANY);
+                    }
+                }
+            }
+        }
+    }
 
     struct inode *inode = BPF_CORE_READ(file, f_inode);
     if (!inode)
@@ -331,11 +662,12 @@ int BPF_PROG(file_open, struct file *file, int mask) {
             else if (filename[0] == 'u' && filename[1] == 'i' && filename[2] == 'n' && filename[3] == 'p' && filename[4] == 'u' && filename[5] == 't' && filename[6] == '\0') {
                 is_blocked_dev = true;
             }
-            // Check for /proc/<pid>/mem (writes only)
+            // Check for /proc/<pid>/mem (writes and reads)
             else if (filename[0] == 'm' && filename[1] == 'e' && filename[2] == 'm' && filename[3] == '\0') {
                 if (parent_name[0] >= '0' && parent_name[0] <= '9') {
-                    if (mask & 0x0002) {
-                        is_blocked_dev = true;
+                    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+                    if (threshold && *threshold > 0) {
+                        return -EACCES; // Block monitored processes from accessing procfs memory files!
                     }
                 }
             }
@@ -415,6 +747,54 @@ int BPF_PROG(file_permission, struct file *file, int mask) {
     if (trusted && *trusted == 1)
         return 0;
 
+    // Check config/blocking mode
+    uint32_t config_idx = 0;
+    uint32_t *mode = bpf_map_lookup_elem(&config_map, &config_idx);
+    uint32_t blocking_enabled = (mode && *mode == 1);
+
+    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+
+    if (blocking_enabled) {
+        struct inode *inode = BPF_CORE_READ(file, f_inode);
+        if (inode) {
+            uint64_t ino = BPF_CORE_READ(inode, i_ino);
+            uint8_t *is_protected = bpf_map_lookup_elem(&protected_static_inodes, &ino);
+            if (is_protected && *is_protected == 1) {
+                if (threshold && *threshold > 0) {
+                    return -EACCES; // Block writing to pre-existing static web-root/config files!
+                }
+            }
+        }
+    }
+
+    // DB bypass: suppress write telemetry for DB processes writing to their own
+    // data directories. Guard: only skip if this process carries ROLE_DATABASE.
+    if (threshold && (*threshold & ROLE_DATABASE)) {
+        struct path f_path = BPF_CORE_READ(file, f_path);
+        struct dentry *dentry = f_path.dentry;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            if (!dentry) break;
+            struct inode *dir_inode = BPF_CORE_READ(dentry, d_inode);
+            if (dir_inode) {
+                uint64_t ino = BPF_CORE_READ(dir_inode, i_ino);
+                uint8_t *bypass = bpf_map_lookup_elem(&bypassed_directories, &ino);
+                if (bypass && *bypass == 1)
+                    return 0;
+            }
+            dentry = BPF_CORE_READ(dentry, d_parent);
+        }
+    }
+
+    if (threshold && *threshold > 0) {
+        struct inode *inode = BPF_CORE_READ(file, f_inode);
+        if (inode) {
+            uint64_t ino = BPF_CORE_READ(inode, i_ino);
+            uint8_t val = 1;
+            bpf_map_update_elem(&newly_created_inodes, &ino, &val, BPF_ANY);
+        }
+    }
+
     struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
     if (event) {
         fill_header(event, EVT_FILE_WRITE, SRC_BPF_LSM, key.pid);
@@ -443,6 +823,21 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
 
     struct process_key key = get_current_process_key();
 
+    // SSHD Pre-Auth Zero-Trust Lockdown:
+    // If the process is running under the unprivileged sshd user's UID,
+    // deny outbound network connection immediately.
+    uint32_t current_uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    uint32_t sshd_uid_key = CONFIG_SSHD_UID;
+    uint32_t *sshd_uid = bpf_map_lookup_elem(&config_map, &sshd_uid_key);
+    if (sshd_uid && *sshd_uid > 0 && current_uid == *sshd_uid) {
+        return -EACCES;
+    }
+
+    // Bypass network blocking for admin sessions
+    if (is_admin_session()) {
+        return 0;
+    }
+
     uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
     if (trusted && *trusted == 1)
         return 0;
@@ -452,32 +847,127 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
     uint32_t *mode = bpf_map_lookup_elem(&config_map, &config_idx);
     uint32_t blocking_enabled = (mode && *mode == 1);
 
-    // 1. GUI Display and PipeWire Socket connect protection
-    if (family == 1 && blocking_enabled) { // AF_UNIX
-        char path[108] = {0};
-        bpf_probe_read_kernel_str(path, sizeof(path), (char *)address + 2); // struct sockaddr_un.sun_path
+    if (blocking_enabled) {
+        uint16_t dest_port = 0;
+        uint32_t dest_ip = 0;
+        if (family == 2) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)address;
+            uint16_t port_be = 0;
+            bpf_probe_read_kernel(&port_be, sizeof(port_be), &sin->sin_port);
+            dest_port = ((port_be & 0xFF) << 8) | ((port_be >> 8) & 0xFF);
+            bpf_probe_read_kernel(&dest_ip, sizeof(dest_ip), &sin->sin_addr.s_addr);
+        } else if (family == 10) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)address;
+            uint16_t port_be = 0;
+            bpf_probe_read_kernel(&port_be, sizeof(port_be), &sin6->sin6_port);
+            dest_port = ((port_be & 0xFF) << 8) | ((port_be >> 8) & 0xFF);
+        }
 
-        bool is_gui_socket = false;
-        // Check for X11 display socket: /tmp/.X11-unix/X*
-        if (path[0] == '/' && path[1] == 't' && path[2] == 'm' && path[3] == 'p' && path[4] == '/' && path[5] == '.' && path[6] == 'X' && path[7] == '1' && path[8] == '1') {
-            is_gui_socket = true;
-        } else {
-            // Check for PipeWire socket: search for "pipewire-0"
-            for (int i = 0; i < 90; i++) {
-                if (path[i] == 'p' && path[i+1] == 'i' && path[i+2] == 'p' && path[i+3] == 'e' && path[i+4] == 'w' && path[i+5] == 'i' && path[i+6] == 'r' && path[i+7] == 'e') {
-                    is_gui_socket = true;
-                    break;
+        // Rule 1: API Port Protection - Block external/public connections to Docker/Kubelet APIs
+        if (dest_port == 2375 || dest_port == 2376 || dest_port == 10250 || dest_port == 10255) {
+            if (family == 2 && !is_private_ip(dest_ip)) {
+                return -EACCES;
+            }
+        }
+    }
+
+    // Egress Port and Role Sandboxing:
+    uint32_t *active_threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (active_threshold && blocking_enabled) {
+        uint32_t thresh_val = *active_threshold;
+
+        // Extract destination port & address for role-based/allowlist checks
+        uint16_t dest_port = 0;
+        uint32_t dest_ip = 0;
+        if (family == 2) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)address;
+            uint16_t port_be = 0;
+            bpf_probe_read_kernel(&port_be, sizeof(port_be), &sin->sin_port);
+            dest_port = ((port_be & 0xFF) << 8) | ((port_be >> 8) & 0xFF);
+            bpf_probe_read_kernel(&dest_ip, sizeof(dest_ip), &sin->sin_addr.s_addr);
+        } else if (family == 10) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)address;
+            uint16_t port_be = 0;
+            bpf_probe_read_kernel(&port_be, sizeof(port_be), &sin6->sin6_port);
+            dest_port = ((port_be & 0xFF) << 8) | ((port_be >> 8) & 0xFF);
+        }
+
+        // 1. PROFILE_ZERO_NETWORK: only allow loopback connect attempts (or DNS/NTP for ROLE_NTP_CLIENT)
+        if (thresh_val & PROFILE_ZERO_NETWORK) {
+            bool is_ntp_bypass = false;
+            if ((thresh_val & ROLE_NTP_CLIENT) && (dest_port == 53 || dest_port == 123)) {
+                is_ntp_bypass = true;
+            }
+            if (!is_ntp_bypass) {
+                if (family == 2) { // AF_INET
+                    struct sockaddr_in *sin = (struct sockaddr_in *)address;
+                    uint32_t daddr = 0;
+                    bpf_probe_read_kernel(&daddr, sizeof(daddr), &sin->sin_addr.s_addr);
+                    if (daddr != 0x0100007f) { // 127.0.0.1 in network byte order
+                        return -EACCES;
+                    }
+                } else if (family == 10) { // AF_INET6
+                    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)address;
+                    uint8_t addr6[16];
+                    bpf_probe_read_kernel(addr6, sizeof(addr6), &sin6->sin6_addr.in6_u.u6_addr8);
+                    bool is_loopback6 = true;
+                    #pragma unroll
+                    for (int i = 0; i < 15; i++) {
+                        if (addr6[i] != 0) is_loopback6 = false;
+                    }
+                    if (addr6[15] != 1) is_loopback6 = false;
+                    if (!is_loopback6) {
+                        return -EACCES;
+                    }
                 }
             }
         }
 
-        if (is_gui_socket) {
-            uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
-            if (threshold && *threshold == 1) {
-                return -EACCES; // Block connection to display/audio server!
+        // 2. ROLE_MAIL_GATEWAY: Only allow DNS (53) and SMTP/S (25, 465, 587)
+        if (thresh_val & ROLE_MAIL_GATEWAY) {
+            if (family == 2 || family == 10) {
+                if (dest_port != 53 && dest_port != 25 && dest_port != 465 && dest_port != 587) {
+                    return -EACCES;
+                }
+            }
+        }
+
+        // 3. ROLE_QUEUE_MANAGER: Only allow cluster, management, and DNS ports
+        if (thresh_val & ROLE_QUEUE_MANAGER) {
+            if (family == 2 || family == 10) {
+                if (dest_port != 53 && dest_port != 5672 && dest_port != 5671 && 
+                    dest_port != 15672 && dest_port != 4369 && dest_port != 9092 && 
+                    dest_port != 9093 && dest_port != 2181) {
+                    return -EACCES;
+                }
+            }
+        }
+
+        // 4. ROLE_DATABASE: Only allow DNS (53) and approved replication/cluster peer IPs
+        if (thresh_val & ROLE_DATABASE) {
+            if (family == 2 || family == 10) {
+                if (dest_port != 53) {
+                    // Check db_outbound_allowlist
+                    struct db_allowlist_key db_key = { key.pid, dest_ip };
+                    uint8_t *allowed = bpf_map_lookup_elem(&db_outbound_allowlist, &db_key);
+                    if (!allowed || *allowed != 1) {
+                        return -EACCES; // Block replication / DB connection unless allowlisted!
+                    }
+                }
+            }
+        }
+
+        // 5. General Infrastructure Egress check against infra_outbound_allowlist
+        if (family == 2) {
+            struct infra_allowlist_key infra_key = { key.pid, dest_ip };
+            uint8_t *allowed_infra = bpf_map_lookup_elem(&infra_outbound_allowlist, &infra_key);
+            if (allowed_infra && *allowed_infra != 1) {
+                return -EACCES;
             }
         }
     }
+
+
 
     // Set PendingNetworkConnect flag in maps (for IPv4/IPv6 connections)
     if (family == 2 || family == 10) {
@@ -570,6 +1060,149 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
 
     struct process_key key = get_current_process_key();
 
+    // SSHD Pre-Auth Zero-Trust Lockdown:
+    // If the process is running under the unprivileged sshd user's UID,
+    // deny execution of any binary (e.g. shells, tools) immediately.
+    uint32_t current_uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    uint32_t sshd_uid_key = CONFIG_SSHD_UID;
+    uint32_t *sshd_uid = bpf_map_lookup_elem(&config_map, &sshd_uid_key);
+    if (sshd_uid && *sshd_uid > 0 && current_uid == *sshd_uid) {
+        return -EACCES;
+    }
+    // 1. If executing a trusted admin binary (like logrotate), mark the process tree as TRUSTED_ADMIN
+    struct inode *bin_inode = BPF_CORE_READ(bprm, file, f_inode);
+    if (bin_inode) {
+        uint64_t ino = BPF_CORE_READ(bin_inode, i_ino);
+        uint8_t *is_admin_bin = bpf_map_lookup_elem(&trusted_admin_binaries, &ino);
+        if (is_admin_bin && *is_admin_bin == 1) {
+            uint32_t pid = key.pid;
+            uint32_t val = TREE_TRUSTED_ADMIN;
+            bpf_map_update_elem(&pid_tree_type_map, &pid, &val, BPF_ANY);
+        }
+    }
+
+    // 2. Enforce execution restrictions on TREE_TRUSTED_ADMIN processes
+    uint32_t current_pid = key.pid;
+    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &current_pid);
+    if (tree_type && (*tree_type & TREE_TRUSTED_ADMIN)) {
+        struct dentry *dentry = BPF_CORE_READ(bprm, file, f_path.dentry);
+        if (dentry) {
+            char exe_name[32] = {0};
+            bpf_probe_read_kernel_str(exe_name, sizeof(exe_name), BPF_CORE_READ(dentry, d_name.name));
+            
+            bool is_allowed_admin_cmd = false;
+            if ((exe_name[0] == 's' && exe_name[1] == 'h' && exe_name[2] == '\0') ||
+                (exe_name[0] == 'b' && exe_name[1] == 'a' && exe_name[2] == 's' && exe_name[3] == 'h' && exe_name[4] == '\0') ||
+                (exe_name[0] == 'g' && exe_name[1] == 'z' && exe_name[2] == 'i' && exe_name[3] == 'p' && exe_name[4] == '\0') ||
+                (exe_name[0] == 'n' && exe_name[1] == 'g' && exe_name[2] == 'i' && exe_name[3] == 'n' && exe_name[4] == 'x' && exe_name[5] == '\0') ||
+                (exe_name[0] == 'k' && exe_name[1] == 'i' && exe_name[2] == 'l' && exe_name[3] == 'l' && exe_name[4] == '\0') ||
+                (exe_name[0] == 'p' && exe_name[1] == 'o' && exe_name[2] == 's' && exe_name[3] == 't' && exe_name[4] == 'f' && exe_name[5] == 'i' && exe_name[6] == 'x' && exe_name[7] == '\0') ||
+                (exe_name[0] == 'm' && exe_name[1] == 'y' && exe_name[2] == 's' && exe_name[3] == 'q' && exe_name[4] == 'l' && exe_name[5] == 'a' && exe_name[6] == 'd' && exe_name[7] == 'm' && exe_name[8] == 'i' && exe_name[9] == 'n' && exe_name[10] == '\0') ||
+                (exe_name[0] == 'r' && exe_name[1] == 'e' && exe_name[2] == 'd' && exe_name[3] == 'i' && exe_name[4] == 's' && exe_name[5] == '-' && exe_name[6] == 'c' && exe_name[7] == 'l' && exe_name[8] == 'i' && exe_name[9] == '\0') ||
+                (exe_name[0] == 'p' && exe_name[1] == 'g' && exe_name[2] == '_' && exe_name[3] == 'c' && exe_name[4] == 't' && exe_name[5] == 'l' && exe_name[6] == '\0') ||
+                (exe_name[0] == 'p' && exe_name[1] == 'g' && exe_name[2] == '_' && exe_name[3] == 'c' && exe_name[4] == 't' && exe_name[5] == 'l' && exe_name[6] == 'c' && exe_name[7] == 'l' && exe_name[8] == 'u' && exe_name[9] == 's' && exe_name[10] == 't' && exe_name[11] == 'e' && exe_name[12] == 'r' && exe_name[13] == '\0') ||
+                (exe_name[0] == 'a' && exe_name[1] == 'p' && exe_name[2] == 'a' && exe_name[3] == 'c' && exe_name[4] == 'h' && exe_name[5] == 'e' && exe_name[6] == '2' && exe_name[7] == 'c' && exe_name[8] == 't' && exe_name[9] == 'l' && exe_name[10] == '\0') ||
+                (exe_name[0] == 'a' && exe_name[1] == 'p' && exe_name[2] == 'a' && exe_name[3] == 'c' && exe_name[4] == 'h' && exe_name[5] == 'e' && exe_name[6] == '2' && exe_name[7] == '\0') ||
+                (exe_name[0] == 'l' && exe_name[1] == 'o' && exe_name[2] == 'g' && exe_name[3] == 'r' && exe_name[4] == 'o' && exe_name[5] == 't' && exe_name[6] == 'a' && exe_name[7] == 't' && exe_name[8] == 'e' && exe_name[9] == '\0')) {
+                is_allowed_admin_cmd = true;
+            }
+            if (!is_allowed_admin_cmd) {
+                return -EACCES; // Block non-safe commands from logrotate tree!
+            }
+        }
+    }
+    // Rule 4: Privileged Container Detection
+    uint32_t host_mnt_ns_idx = CONFIG_HOST_MNT_NS;
+    uint32_t *host_mnt_ns = bpf_map_lookup_elem(&config_map, &host_mnt_ns_idx);
+    if (host_mnt_ns && *host_mnt_ns > 0) {
+        uint32_t current_mnt_ns = get_current_mnt_ns_inum();
+        if (current_mnt_ns != *host_mnt_ns) {
+            uint32_t host_pid_ns_idx = CONFIG_HOST_PID_NS;
+            uint32_t *host_pid_ns = bpf_map_lookup_elem(&config_map, &host_pid_ns_idx);
+            uint32_t host_net_ns_idx = CONFIG_HOST_NET_NS;
+            uint32_t *host_net_ns = bpf_map_lookup_elem(&config_map, &host_net_ns_idx);
+
+            bool is_privileged = false;
+            if (host_pid_ns && *host_pid_ns > 0) {
+                if (get_current_pid_ns_inum() == *host_pid_ns) {
+                    is_privileged = true;
+                }
+            }
+            if (host_net_ns && *host_net_ns > 0) {
+                if (get_current_net_ns_inum() == *host_net_ns) {
+                    is_privileged = true;
+                }
+            }
+            
+            struct task_struct *current_task = (struct task_struct *)bpf_get_current_task();
+            if (current_task) {
+                const struct cred *cred = BPF_CORE_READ(current_task, cred);
+                if (cred) {
+                    kernel_cap_t cap_effective = BPF_CORE_READ(cred, cap_effective);
+                    if (cap_effective.val & (1ULL << 21)) { // CAP_SYS_ADMIN is bit 21
+                        is_privileged = true;
+                    }
+                }
+            }
+
+            if (is_privileged) {
+                uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
+                if (!trusted || *trusted != 1) {
+                    struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+                    if (event) {
+                        fill_header(event, EVT_IMAGE_LOAD, SRC_BPF_LSM, key.pid);
+                        struct dentry *dentry = BPF_CORE_READ(bprm, file, f_path.dentry);
+                        if (dentry) {
+                            bpf_probe_read_kernel_str(event->details.image_load.module_path,
+                                                      sizeof(event->details.image_load.module_path),
+                                                      BPF_CORE_READ(dentry, d_name.name));
+                        }
+                        bpf_ringbuf_submit(event, 0);
+                    }
+                    return -EACCES; // Block execution of untrusted privileged containers!
+                }
+            }
+        }
+    }
+
+    // Detect new login session
+    char parent_comm[16] = {0};
+    int is_login_parent = 0;
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (task) {
+        struct task_struct *real_parent;
+        bpf_probe_read_kernel(&real_parent, sizeof(real_parent), &task->real_parent);
+        if (real_parent) {
+            bpf_probe_read_kernel_str(parent_comm, sizeof(parent_comm), &real_parent->comm);
+            if ((parent_comm[0] == 's' && parent_comm[1] == 's' && parent_comm[2] == 'h' && parent_comm[3] == 'd') ||
+                (parent_comm[0] == 'l' && parent_comm[1] == 'o' && parent_comm[2] == 'g' && parent_comm[3] == 'i' && parent_comm[4] == 'n')) {
+                is_login_parent = 1;
+            }
+        }
+    }
+
+    if (is_login_parent) {
+        struct signal_struct *signal = NULL;
+        bpf_probe_read_kernel(&signal, sizeof(signal), &task->signal);
+        if (signal) {
+            struct tty_struct *tty = NULL;
+            bpf_probe_read_kernel(&tty, sizeof(tty), &signal->tty);
+            if (tty) {
+                // Yes! This is a login session with a TTY/PTY. Stamp it as TREE_ADMIN_SESSION!
+                uint32_t pid = key.pid;
+                uint32_t flag = TREE_ADMIN_SESSION;
+                bpf_map_update_elem(&pid_tree_type_map, &pid, &flag, BPF_ANY);
+                uint8_t allowed = 1;
+                bpf_map_update_elem(&admin_session_pids, &pid, &allowed, BPF_ANY);
+            }
+        }
+    }
+
+    // Bypass execution blocking for admin sessions
+    if (is_admin_session()) {
+        return 0;
+    }
+
     // Check config/blocking mode
     uint32_t config_idx = 0;
     uint32_t *mode = bpf_map_lookup_elem(&config_map, &config_idx);
@@ -592,6 +1225,109 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
                 // If blocking is enabled, untrusted files default to Threshold = 1 (Untrusted)
                 uint32_t threshold = 1;
                 bpf_map_update_elem(&process_threshold_map, &key, &threshold, BPF_ANY);
+            }
+        }
+    }
+
+    uint32_t *active_threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (active_threshold && blocking_enabled) {
+        // Block execution of any newly created/written files
+        if (bprm_file) {
+            struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
+            if (inode) {
+                uint64_t ino = BPF_CORE_READ(inode, i_ino);
+                uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &ino);
+                if (is_newly_created && *is_newly_created == 1) {
+                    if (active_threshold && *active_threshold > 0) {
+                        return -EACCES;
+                    }
+                }
+            }
+        }
+
+        uint32_t thresh_val = *active_threshold;
+
+        // PROFILE_ZERO_EXECUTION: unconditionally deny execution
+        if (thresh_val & PROFILE_ZERO_EXECUTION) {
+            return -EACCES;
+        }
+
+        // PROFILE_RESTRICTED_EXEC: check exec_allowlist_map
+        if (thresh_val & PROFILE_RESTRICTED_EXEC) {
+            if (bprm_file) {
+                struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
+                if (inode) {
+                    uint64_t ino = BPF_CORE_READ(inode, i_ino);
+                    uint8_t *allowed = bpf_map_lookup_elem(&exec_allowlist_map, &ino);
+                    if (!allowed || *allowed != 1) {
+                        return -EACCES; // Deny execution of unapproved binary
+                    }
+                }
+            }
+        }
+    }
+
+    // Universal Dangerous-Exec Filter: L1 / L2 blocks for known dangerous tools in monitored contexts
+    if (bprm_file) {
+        struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
+        if (inode) {
+            char exe_name[32] = {0};
+            struct dentry *dentry = BPF_CORE_READ(bprm_file, f_path.dentry);
+            if (dentry) {
+                bpf_probe_read_kernel_str(exe_name, sizeof(exe_name), BPF_CORE_READ(dentry, d_name.name));
+            }
+
+            // Check for dangerous binaries: nc, ncat, netcat, socat, tftp
+            bool is_dangerous_tool = false;
+            // "nc\0"
+            if (exe_name[0] == 'n' && exe_name[1] == 'c' && exe_name[2] == '\0') {
+                is_dangerous_tool = true;
+            }
+            // "ncat"
+            else if (exe_name[0] == 'n' && exe_name[1] == 'c' && exe_name[2] == 'a' && exe_name[3] == 't' && exe_name[4] == '\0') {
+                is_dangerous_tool = true;
+            }
+            // "netcat"
+            else if (exe_name[0] == 'n' && exe_name[1] == 'e' && exe_name[2] == 't' && exe_name[3] == 'c' && exe_name[4] == 'a' && exe_name[5] == 't' && exe_name[6] == '\0') {
+                is_dangerous_tool = true;
+            }
+            // "socat"
+            else if (exe_name[0] == 's' && exe_name[1] == 'o' && exe_name[2] == 'c' && exe_name[3] == 'a' && exe_name[4] == 't' && exe_name[5] == '\0') {
+                is_dangerous_tool = true;
+            }
+            // "tftp"
+            else if (exe_name[0] == 't' && exe_name[1] == 'f' && exe_name[2] == 't' && exe_name[3] == 'p' && exe_name[4] == '\0') {
+                is_dangerous_tool = true;
+            }
+
+            // Check for privilege escalation tools: sudo, su, pkexec, newuidmap, newgidmap
+            bool is_priv_esc = false;
+            // "sudo"
+            if (exe_name[0] == 's' && exe_name[1] == 'u' && exe_name[2] == 'd' && exe_name[3] == 'o' && exe_name[4] == '\0') {
+                is_priv_esc = true;
+            }
+            // "su"
+            else if (exe_name[0] == 's' && exe_name[1] == 'u' && exe_name[2] == '\0') {
+                is_priv_esc = true;
+            }
+            // "pkexec"
+            else if (exe_name[0] == 'p' && exe_name[1] == 'k' && exe_name[2] == 'e' && exe_name[3] == 'x' && exe_name[4] == 'e' && exe_name[5] == 'c' && exe_name[6] == '\0') {
+                is_priv_esc = true;
+            }
+            // "newuidmap"
+            else if (exe_name[0] == 'n' && exe_name[1] == 'e' && exe_name[2] == 'w' && exe_name[3] == 'u' && exe_name[4] == 'i' && exe_name[5] == 'd' && exe_name[6] == 'm' && exe_name[7] == 'a' && exe_name[8] == 'p' && exe_name[9] == '\0') {
+                is_priv_esc = true;
+            }
+            // "newgidmap"
+            else if (exe_name[0] == 'n' && exe_name[1] == 'e' && exe_name[2] == 'w' && exe_name[3] == 'g' && exe_name[4] == 'i' && exe_name[5] == 'd' && exe_name[6] == 'm' && exe_name[7] == 'a' && exe_name[8] == 'p' && exe_name[9] == '\0') {
+                is_priv_esc = true;
+            }
+
+            if ((is_dangerous_tool || is_priv_esc) && blocking_enabled) {
+                // If it is in a monitored context (threshold exists and is > 0), block!
+                if (active_threshold && *active_threshold > 0) {
+                    return -EACCES; // Block dangerous/priv-esc execution in monitored contexts!
+                }
             }
         }
     }
@@ -636,12 +1372,22 @@ int BPF_PROG(ptrace_access_check, struct task_struct *child, unsigned int mode) 
     if (!child) return 0;
 
     struct process_key key = get_current_process_key();
+    uint32_t tracee_pid = BPF_CORE_READ(child, tgid);
+    uint32_t tracer_pid = key.pid;
+
+    // Protect admin session from ptrace attempts by non-admin processes
+    uint32_t *tracee_tree = bpf_map_lookup_elem(&pid_tree_type_map, &tracee_pid);
+    if (tracee_tree && (*tracee_tree & TREE_ADMIN_SESSION)) {
+        uint32_t *tracer_tree = bpf_map_lookup_elem(&pid_tree_type_map, &tracer_pid);
+        if (!tracer_tree || !(*tracer_tree & TREE_ADMIN_SESSION)) {
+            return -EACCES; // Block non-admin tracing admin process!
+        }
+    }
 
     // Fix 8/11: Emit EVT_PTRACE_ATTACH telemetry on EVERY ptrace attempt,
     // regardless of trust level. This allows the agent to correlate injection
     // attempts on high-value targets (browser, ssh-agent, gpg-agent) even when
     // both processes appear trusted.
-    uint32_t tracee_pid = BPF_CORE_READ(child, tgid);
     struct TelemetryEvent *ptrace_evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
     if (ptrace_evt) {
         fill_header(ptrace_evt, EVT_PTRACE_ATTACH, SRC_BPF_LSM, key.pid);
@@ -659,8 +1405,53 @@ int BPF_PROG(ptrace_access_check, struct task_struct *child, unsigned int mode) 
     uint32_t *mode_val = bpf_map_lookup_elem(&config_map, &config_idx);
     if (mode_val && *mode_val == 1) {
         uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+        if (threshold && *threshold > 0) {
+            if (tracee_pid != tracer_pid) {
+                return -EACCES; // Block monitored processes from tracing/reading other processes' memory!
+            }
+        }
         if (threshold && *threshold == 1) {
             return -EACCES; // Block untrusted process from ptrace attachments!
+        }
+    }
+
+    return 0;
+}
+
+SEC("lsm/task_kill")
+int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int sig, const struct cred *cred) {
+    if (!p) return 0;
+
+    uint32_t target_pid = BPF_CORE_READ(p, tgid);
+    uint32_t current_pid = bpf_get_current_pid_tgid() >> 32;
+
+    // Ignore self-signals
+    if (target_pid == current_pid) return 0;
+
+    // Check if target is Warden
+    char target_comm[16] = {0};
+    bpf_probe_read_kernel_str(target_comm, sizeof(target_comm), &p->comm);
+    int is_target_warden = (target_comm[0] == 'w' && target_comm[1] == 'a' && target_comm[2] == 'r' && target_comm[3] == 'd' && target_comm[4] == 'e' && target_comm[5] == 'n');
+
+    // Check if target is admin session
+    uint32_t *target_tree = bpf_map_lookup_elem(&pid_tree_type_map, &target_pid);
+    int is_target_admin = (target_tree && (*target_tree & TREE_ADMIN_SESSION));
+
+    if (is_target_warden || is_target_admin) {
+        // Allow if sender is Warden
+        char current_comm[16] = {0};
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        if (task) {
+            bpf_probe_read_kernel_str(current_comm, sizeof(current_comm), &task->comm);
+        }
+        int is_sender_warden = (current_comm[0] == 'w' && current_comm[1] == 'a' && current_comm[2] == 'r' && current_comm[3] == 'd' && current_comm[4] == 'e' && current_comm[5] == 'n');
+        
+        // Allow if sender is admin session
+        uint32_t *sender_tree = bpf_map_lookup_elem(&pid_tree_type_map, &current_pid);
+        int is_sender_admin = (sender_tree && (*sender_tree & TREE_ADMIN_SESSION));
+
+        if (!is_sender_warden && !is_sender_admin) {
+            return -EPERM; // Deny signal delivery!
         }
     }
 
@@ -683,6 +1474,16 @@ int BPF_PROG(file_mprotect, struct vm_area_struct *vma,
     // Check config/blocking mode
     uint32_t config_idx = 0;
     uint32_t *mode_val = bpf_map_lookup_elem(&config_map, &config_idx);
+    uint32_t blocking_enabled = (mode_val && *mode_val == 1);
+
+    // Block RWX mappings (W^X violation) unless in jvm_exception_pids
+    if ((newprot & 0x2) && (newprot & 0x4)) { // PROT_WRITE=2, PROT_EXEC=4
+        uint32_t pid = key.pid;
+        uint8_t *exc = bpf_map_lookup_elem(&jvm_exception_pids, &pid);
+        if (!exc && blocking_enabled) {
+            return -EACCES;
+        }
+    }
     struct file *vm_file = BPF_CORE_READ(vma, vm_file);
 
     if (mode_val && *mode_val == 1) {
@@ -736,6 +1537,20 @@ int BPF_PROG(mmap_file, struct file *file, unsigned long reqprot,
 
     struct process_key key = get_current_process_key();
 
+    // Check config/blocking mode
+    uint32_t config_idx = 0;
+    uint32_t *mode_val = bpf_map_lookup_elem(&config_map, &config_idx);
+    uint32_t blocking_enabled = (mode_val && *mode_val == 1);
+
+    // Block RWX mappings (W^X violation) unless in jvm_exception_pids
+    if (prot & 0x2) { // PROT_WRITE=2 (PROT_EXEC=4 already checked)
+        uint32_t pid = key.pid;
+        uint8_t *exc = bpf_map_lookup_elem(&jvm_exception_pids, &pid);
+        if (!exc && blocking_enabled) {
+            return -EACCES;
+        }
+    }
+
     // Skip absolutely-trusted processes (e.g., kinnector itself)
     uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
     if (trusted && *trusted == 1)
@@ -764,28 +1579,31 @@ int BPF_PROG(mmap_file, struct file *file, unsigned long reqprot,
 
 SEC("lsm/socket_listen")
 int BPF_PROG(socket_listen, struct socket *sock, int backlog) {
-    if (!sock) return 0;
-    struct sock *sk = BPF_CORE_READ(sock, sk);
-    if (!sk) return 0;
+    return 0;
+}
 
-    uint16_t port = BPF_CORE_READ(sk, __sk_common.skc_num);
+SEC("lsm/path_chmod")
+int BPF_PROG(path_chmod, const struct path *path, umode_t mode) {
+    if (!path) return 0;
 
-    // If port is VNC (5900-5910) or RDP (3389)
-    if ((port >= 5900 && port <= 5910) || port == 3389) {
-        struct process_key key = get_current_process_key();
+    uint32_t config_idx = 0;
+    uint32_t *mode_val = bpf_map_lookup_elem(&config_map, &config_idx);
+    uint32_t blocking_enabled = (mode_val && *mode_val == 1);
+    if (!blocking_enabled) return 0;
 
-        uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
-        if (trusted && *trusted == 1)
-            return 0;
-
-        uint32_t config_idx = 0;
-        uint32_t *mode_val = bpf_map_lookup_elem(&config_map, &config_idx);
-        if (mode_val && *mode_val == 1) {
-            uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
-            if (threshold && *threshold == 1) {
-                return -EACCES; // Block listening on VNC/RDP ports!
-            }
+    // If setting any executable permission bits (S_IXUSR, S_IXGRP, S_IXOTH)
+    if (mode & (0100 | 0010 | 0001)) {
+        if (is_admin_session()) {
+            return 0; // Allow active admin operators (SSH shell, PTY)
         }
+
+        struct process_key key = get_current_process_key();
+        uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
+        if (trusted && *trusted == 1) {
+            return 0; // Allow system installers, updates, and trusted tools
+        }
+
+        return -EACCES; // Strictly block any other process from making files executable!
     }
     return 0;
 }
@@ -848,6 +1666,10 @@ int tracepoint_sched_process_exit(struct trace_event_raw_sched_process_template 
     bpf_map_delete_elem(&trusted_ancestor_roots,   &key);
     bpf_map_delete_elem(&process_threshold_map,    &key);
     bpf_map_delete_elem(&tainted_process_map,      &key);
+    uint32_t pid = key.pid;
+    bpf_map_delete_elem(&pid_tree_type_map,        &pid);
+    bpf_map_delete_elem(&jvm_exception_pids,       &pid);
+    bpf_map_delete_elem(&admin_session_pids,       &pid);
 
     struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
     if (event) {
@@ -856,6 +1678,79 @@ int tracepoint_sched_process_exit(struct trace_event_raw_sched_process_template 
         event->details.process_stop._pad = 0;
         bpf_ringbuf_submit(event, 0);
     }
+    return 0;
+}
+
+// DB-1: sched/sched_process_fork — propagate parent's threshold & trust to forked child.
+// Critical for database worker processes (PostgreSQL bgworkers, Redis BGSAVE) that
+// are created via fork() without execve, so exec-time hooks never fire for them.
+struct sched_process_fork_args {
+    unsigned long long pad;
+    char parent_comm[16];
+    uint32_t parent_pid;
+    char child_comm[16];
+    uint32_t child_pid;
+};
+
+SEC("tracepoint/sched/sched_process_fork")
+int tracepoint_sched_process_fork(struct sched_process_fork_args *ctx) {
+    // Build parent key from parent_pid + start_time via task_struct walk
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task)
+        return 0;
+
+    struct process_key parent_key = {0};
+    parent_key.pid = ctx->parent_pid;
+    bpf_probe_read_kernel(&parent_key.start_time, sizeof(parent_key.start_time),
+                          &task->start_time);
+
+    // Propagate pid_tree_type_map
+    uint32_t parent_pid = ctx->parent_pid;
+    uint32_t child_pid = ctx->child_pid;
+    uint32_t *parent_tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &parent_pid);
+    if (parent_tree_type) {
+        uint32_t val = *parent_tree_type;
+        bpf_map_update_elem(&pid_tree_type_map, &child_pid, &val, BPF_ANY);
+    }
+
+    // Propagate jvm_exception_pids
+    uint8_t *parent_jvm_exc = bpf_map_lookup_elem(&jvm_exception_pids, &parent_pid);
+    if (parent_jvm_exc) {
+        uint8_t val = *parent_jvm_exc;
+        bpf_map_update_elem(&jvm_exception_pids, &child_pid, &val, BPF_ANY);
+    }
+
+    // Propagate admin_session_pids
+    uint8_t *parent_admin_pid = bpf_map_lookup_elem(&admin_session_pids, &parent_pid);
+    if (parent_admin_pid) {
+        uint8_t val = *parent_admin_pid;
+        bpf_map_update_elem(&admin_session_pids, &child_pid, &val, BPF_ANY);
+    }
+
+    // Look up parent's threshold (contains ROLE_DATABASE flag)
+    uint32_t *parent_threshold = bpf_map_lookup_elem(&process_threshold_map, &parent_key);
+    uint8_t  *parent_trusted   = bpf_map_lookup_elem(&trusted_ancestor_roots, &parent_key);
+
+    // Only propagate if parent has a meaningful entry
+    if (!parent_threshold && !parent_trusted)
+        return 0;
+
+    // Child key: pid from fork args; start_time filled from child task
+    // The child's start_time is not yet stable at fork, so we use parent's start_time
+    // as a temporary seed — user-space will correct it on next ProcessCreate event.
+    struct process_key child_key = {0};
+    child_key.pid = ctx->child_pid;
+    child_key.start_time = parent_key.start_time; // best-effort at fork time
+
+    if (parent_threshold) {
+        uint32_t val = *parent_threshold;
+        bpf_map_update_elem(&process_threshold_map, &child_key, &val, BPF_ANY);
+    }
+    if (parent_trusted) {
+        uint8_t val = *parent_trusted;
+        bpf_map_update_elem(&trusted_ancestor_roots, &child_key, &val, BPF_ANY);
+    }
+
     return 0;
 }
 
