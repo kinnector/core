@@ -150,6 +150,7 @@ struct TelemetryEvent {
 #define TREE_ADMIN_SESSION         0x00010000u
 #define TREE_TRUSTED_ADMIN         0x00020000u
 #define TREE_AUTOMATION            0x00040000u
+#define TREE_INSTALL_CONTEXT       0x00080000u
 
 // ---------------------------------------------------------------------------
 // BPF Maps
@@ -483,6 +484,39 @@ static __always_inline int is_admin_session() {
     return 0;
 }
 
+static __always_inline int is_install_session() {
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
+    if (tree_type && (*tree_type & TREE_INSTALL_CONTEXT)) {
+        return 1;
+    }
+    return 0;
+}
+
+static __always_inline bool is_install_binary(const char *name) {
+    #pragma unroll
+    for (int i = 0; i < 90; i++) {
+        if (name[i] == '\0') break;
+        if (name[i] == '/' && name[i+1] == 'n' && name[i+2] == 'p' && name[i+3] == 'm') return true;
+        if (name[i] == '/' && name[i+1] == 'y' && name[i+2] == 'a' && name[i+3] == 'r' && name[i+4] == 'n') return true;
+        if (name[i] == '/' && name[i+1] == 'p' && name[i+2] == 'n' && name[i+3] == 'p' && name[i+4] == 'm') return true;
+        if (name[i] == '/' && name[i+1] == 'p' && name[i+2] == 'i' && name[i+3] == 'p') return true;
+        if (name[i] == '/' && name[i+1] == 'c' && name[i+2] == 'o' && name[i+3] == 'm' && name[i+4] == 'p' && name[i+5] == 'o' && name[i+6] == 's' && name[i+7] == 'e' && name[i+8] == 'r') return true;
+        if (name[i] == '/' && name[i+1] == 'c' && name[i+2] == 'a' && name[i+3] == 'r' && name[i+4] == 'g' && name[i+5] == 'o') return true;
+        if (name[i] == '/' && name[i+1] == 'g' && name[i+2] == 'e' && name[i+3] == 'm') return true;
+        if (name[i] == '/' && name[i+1] == 'b' && name[i+2] == 'u' && name[i+3] == 'n' && name[i+4] == 'd' && name[i+5] == 'l' && name[i+6] == 'e') return true;
+        if (name[i] == '/' && name[i+1] == 'g' && name[i+2] == 'r' && name[i+3] == 'a' && name[i+4] == 'd' && name[i+5] == 'l' && name[i+6] == 'e') return true;
+        if (name[i] == '/' && name[i+1] == 'm' && name[i+2] == 'v' && name[i+3] == 'n') return true;
+        if (name[i] == '/' && name[i+1] == 'a' && name[i+2] == 'p' && name[i+3] == 't') return true;
+        if (name[i] == '/' && name[i+1] == 'd' && name[i+2] == 'p' && name[i+3] == 'k' && name[i+4] == 'g') return true;
+    }
+    if (name[0] == 'n' && name[1] == 'p' && name[2] == 'm' && name[3] == '\0') return true;
+    if (name[0] == 'y' && name[1] == 'a' && name[2] == 'r' && name[3] == 'n' && name[4] == '\0') return true;
+    if (name[0] == 'p' && name[1] == 'i' && name[2] == 'p' && name[3] == '\0') return true;
+    if (name[0] == 'c' && name[1] == 'a' && name[2] == 'r' && name[3] == 'g' && name[4] == 'o' && name[5] == '\0') return true;
+    return false;
+}
+
 static __always_inline struct process_key get_current_process_key() {
     struct process_key key = {0};
     uint64_t pid_tgid = bpf_get_current_pid_tgid();
@@ -562,7 +596,7 @@ int BPF_PROG(file_open, struct file *file, int mask) {
     }
 
     // Admin Session Hook: Allow everything EXCEPT dynamic library injection attempts (.so from writable dirs)
-    if (is_admin_session()) {
+    if (is_admin_session() && !is_install_session()) {
         struct path f_path = BPF_CORE_READ(file, f_path);
         struct dentry *dentry = f_path.dentry;
         if (dentry) {
@@ -651,14 +685,15 @@ int BPF_PROG(file_open, struct file *file, int mask) {
             }
 
             uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
-            if (threshold && *threshold > 0) {
+            bool is_install = is_install_session();
+            if ((threshold && *threshold > 0) || is_install) {
                 // 1. Block .git reads unconditionally for all monitored processes (including daemon and forks)
                 if (is_git_file(filename)) {
                     return -EACCES;
                 }
 
-                // 2. Block spawned subprocesses (untrusted) from reading .env*
-                if (*threshold == 1) {
+                // 2. Block spawned subprocesses (untrusted) or install context from reading .env*
+                if ((threshold && *threshold == 1) || is_install) {
                     if (is_env_file(filename)) {
                         return -EACCES;
                     }
@@ -718,7 +753,8 @@ int BPF_PROG(file_open, struct file *file, int mask) {
             else if (filename[0] == 'm' && filename[1] == 'e' && filename[2] == 'm' && filename[3] == '\0') {
                 if (parent_name[0] >= '0' && parent_name[0] <= '9') {
                     uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
-                    if (threshold && *threshold > 0) {
+                    bool is_install_proc = is_install_session();
+                    if ((threshold && *threshold > 0) || is_install_proc) {
                         return -EACCES; // Block monitored processes from accessing procfs memory files!
                     }
                 }
@@ -726,7 +762,8 @@ int BPF_PROG(file_open, struct file *file, int mask) {
 
             if (is_blocked_dev) {
                 uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
-                if (threshold && *threshold == 1) {
+                bool is_install_proc = is_install_session();
+                if ((threshold && *threshold == 1) || is_install_proc) {
                     return -EACCES; // Block synchronously!
                 }
             }
@@ -738,10 +775,11 @@ int BPF_PROG(file_open, struct file *file, int mask) {
     if (!category)
         return 0;
 
-    // Check if the process threshold is 1 (Untrusted)
+    // Check if the process threshold is 1 (Untrusted) or in install context
     if (blocking_enabled) {
         uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
-        if (threshold && *threshold == 1) {
+        bool is_install_proc = is_install_session();
+        if ((threshold && *threshold == 1) || is_install_proc) {
             // Emit blocked event first
             struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
             if (event) {
@@ -885,8 +923,8 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
         return -EACCES;
     }
 
-    // Bypass network blocking for admin sessions
-    if (is_admin_session()) {
+    // Bypass network blocking for admin sessions (unless it is an install context)
+    if (is_admin_session() && !is_install_session()) {
         return 0;
     }
 
@@ -1031,16 +1069,18 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
     if ((family == 2 || family == 10) && blocking_enabled) {
         uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
         if (threshold && *threshold == 1) {
-            // Emit blocked event first
-            struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
-            if (event) {
-                fill_header(event, EVT_NETWORK_CONNECT, SRC_BPF_LSM, key.pid);
-                event->details.network_connect.destination_port = 0;
-                event->details.network_connect.destination_ip[0] = '\0';
-                event->details.network_connect.protocol[0] = '\0';
-                bpf_ringbuf_submit(event, 0);
+            if (!is_install_session()) {
+                // Emit blocked event first
+                struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+                if (event) {
+                    fill_header(event, EVT_NETWORK_CONNECT, SRC_BPF_LSM, key.pid);
+                    event->details.network_connect.destination_port = 0;
+                    event->details.network_connect.destination_ip[0] = '\0';
+                    event->details.network_connect.protocol[0] = '\0';
+                    bpf_ringbuf_submit(event, 0);
+                }
+                return -EACCES; // Block connection synchronously!
             }
-            return -EACCES; // Block connection synchronously!
         }
     }
 
@@ -1111,6 +1151,25 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         return 0;
 
     struct process_key key = get_current_process_key();
+    
+    // Check if executing a package manager/install binary to mark the process tree as TREE_INSTALL_CONTEXT
+    const char *filename_ptr = 0;
+    bpf_probe_read_kernel(&filename_ptr, sizeof(filename_ptr), &bprm->filename);
+    if (filename_ptr) {
+        char filename[128] = {0};
+        bpf_probe_read_kernel_str(filename, sizeof(filename), filename_ptr);
+        if (is_install_binary(filename)) {
+            uint32_t pid = key.pid;
+            uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
+            if (tree_type) {
+                *tree_type &= ~TREE_ADMIN_SESSION;
+                *tree_type |= TREE_INSTALL_CONTEXT;
+            } else {
+                uint32_t val = TREE_INSTALL_CONTEXT;
+                bpf_map_update_elem(&pid_tree_type_map, &pid, &val, BPF_ANY);
+            }
+        }
+    }
 
     // SSHD Pre-Auth Zero-Trust Lockdown:
     // If the process is running under the unprivileged sshd user's UID,
@@ -1225,10 +1284,33 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         struct task_struct *real_parent;
         bpf_probe_read_kernel(&real_parent, sizeof(real_parent), &task->real_parent);
         if (real_parent) {
-            bpf_probe_read_kernel_str(parent_comm, sizeof(parent_comm), &real_parent->comm);
-            if ((parent_comm[0] == 's' && parent_comm[1] == 's' && parent_comm[2] == 'h' && parent_comm[3] == 'd') ||
-                (parent_comm[0] == 'l' && parent_comm[1] == 'o' && parent_comm[2] == 'g' && parent_comm[3] == 'i' && parent_comm[4] == 'n')) {
-                is_login_parent = 1;
+            struct mm_struct *mm = NULL;
+            bpf_probe_read_kernel(&mm, sizeof(mm), &real_parent->mm);
+            if (mm) {
+                struct file *exe_file = NULL;
+                bpf_probe_read_kernel(&exe_file, sizeof(exe_file), &mm->exe_file);
+                if (exe_file) {
+                    struct dentry *dentry = NULL;
+                    bpf_probe_read_kernel(&dentry, sizeof(dentry), &exe_file->f_path.dentry);
+                    if (dentry) {
+                        char name[16] = {0};
+                        bpf_probe_read_kernel_str(name, sizeof(name), &dentry->d_name.name);
+                        if ((name[0] == 's' && name[1] == 's' && name[2] == 'h' && name[3] == 'd' && name[4] == '\0') ||
+                            (name[0] == 'l' && name[1] == 'o' && name[2] == 'g' && name[3] == 'i' && name[4] == 'n' && name[5] == '\0')) {
+                            
+                            struct dentry *parent_dentry = NULL;
+                            bpf_probe_read_kernel(&parent_dentry, sizeof(parent_dentry), &dentry->d_parent);
+                            if (parent_dentry) {
+                                char p_name[16] = {0};
+                                bpf_probe_read_kernel_str(p_name, sizeof(p_name), &parent_dentry->d_name.name);
+                                if ((p_name[0] == 's' && p_name[1] == 'b' && p_name[2] == 'i' && p_name[3] == 'n' && p_name[4] == '\0') ||
+                                    (p_name[0] == 'b' && p_name[1] == 'i' && p_name[2] == 'n' && p_name[3] == '\0')) {
+                                    is_login_parent = 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1250,8 +1332,8 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         }
     }
 
-    // Bypass execution blocking for admin sessions
-    if (is_admin_session()) {
+    // Bypass execution blocking for admin sessions (unless it is an install context)
+    if (is_admin_session() && !is_install_session()) {
         return 0;
     }
 
@@ -1291,7 +1373,9 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
                 uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &ino);
                 if (is_newly_created && *is_newly_created == 1) {
                     if (active_threshold && *active_threshold > 0) {
-                        return -EACCES;
+                        if (!is_install_session()) {
+                            return -EACCES;
+                        }
                     }
                 }
             }
@@ -1645,11 +1729,19 @@ int BPF_PROG(path_chmod, const struct path *path, umode_t mode) {
 
     // If setting any executable permission bits (S_IXUSR, S_IXGRP, S_IXOTH)
     if (mode & (0100 | 0010 | 0001)) {
-        if (is_admin_session()) {
-            return 0; // Allow active admin operators (SSH shell, PTY)
+        struct process_key key = get_current_process_key();
+        uint8_t *active_threshold = bpf_map_lookup_elem(&process_thresholds, &key);
+        if (!active_threshold || *active_threshold == 0) {
+            return 0; // Not a monitored process, allow chmod
         }
 
-        struct process_key key = get_current_process_key();
+        if (is_admin_session() && !is_install_session()) {
+            return 0; // Allow active admin operators (SSH shell, PTY)
+        }
+        if (is_install_session()) {
+            return 0; // Allow package managers to set executable bits during install
+        }
+
         uint8_t *trusted = bpf_map_lookup_elem(&trusted_ancestor_roots, &key);
         if (trusted && *trusted == 1) {
             return 0; // Allow system installers, updates, and trusted tools

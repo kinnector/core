@@ -56,6 +56,7 @@ public:
     bool DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t start_time);
     bool AddSensitiveInode(uint64_t inode, uint32_t category);
     bool AddProtectedStaticInode(uint64_t inode);
+    bool RemoveProtectedStaticInode(uint64_t inode);
     bool AddTrustedExecInode(uint64_t inode, uint32_t trust_level);
     // Fix 10: query whether an inode is present in the trusted_exec_inodes BPF map
     bool LookupTrustedExecInode(uint64_t inode);

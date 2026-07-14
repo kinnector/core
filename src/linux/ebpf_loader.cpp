@@ -454,6 +454,18 @@ bool EbpfLoader::AddProtectedStaticInode(uint64_t inode) {
     return bpf_map_update_elem(bpf_map__fd(map), &inode, &val, BPF_ANY) == 0;
 }
 
+bool EbpfLoader::RemoveProtectedStaticInode(uint64_t inode) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "protected_static_inodes");
+    if (!map) return false;
+
+    return bpf_map_delete_elem(bpf_map__fd(map), &inode) == 0;
+}
+
 bool EbpfLoader::AddTrustedExecInode(uint64_t inode, uint32_t trust_level) {
     if (mock_mode_ || !bpf_obj_) {
         return true;

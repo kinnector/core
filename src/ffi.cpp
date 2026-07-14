@@ -277,6 +277,16 @@ bool add_protected_static_inode(uint64_t inode) {
     return false;
 }
 
+bool remove_protected_static_inode(uint64_t inode) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->RemoveProtectedStaticInode(inode);
+    }
+#endif
+    return false;
+}
+
 bool add_bypassed_directory_inode(uint64_t inode) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
