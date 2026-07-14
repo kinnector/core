@@ -422,6 +422,58 @@ static __always_inline uint32_t get_current_net_ns_inum() {
     if (!net) return 0;
     return BPF_CORE_READ(net, ns.inum);
 }
+
+// ---------------------------------------------------------------------------
+// Container Identification & Privilege Exemption Helpers
+// ---------------------------------------------------------------------------
+
+static __always_inline int is_container_process() {
+    uint32_t host_mnt_ns_idx = CONFIG_HOST_MNT_NS;
+    uint32_t *host_mnt_ns = bpf_map_lookup_elem(&config_map, &host_mnt_ns_idx);
+    if (host_mnt_ns && *host_mnt_ns > 0) {
+        uint32_t current_mnt_ns = get_current_mnt_ns_inum();
+        if (current_mnt_ns != *host_mnt_ns) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static __always_inline int is_container_restricted() {
+    if (!is_container_process()) {
+        return 0; // Not inside a container namespace
+    }
+
+    uint32_t host_pid_ns_idx = CONFIG_HOST_PID_NS;
+    uint32_t *host_pid_ns = bpf_map_lookup_elem(&config_map, &host_pid_ns_idx);
+    uint32_t host_net_ns_idx = CONFIG_HOST_NET_NS;
+    uint32_t *host_net_ns = bpf_map_lookup_elem(&config_map, &host_net_ns_idx);
+
+    if (host_pid_ns && *host_pid_ns > 0) {
+        if (get_current_pid_ns_inum() == *host_pid_ns) {
+            return 0; // Exempt host-PID sharing containers (e.g. CSI/CNI drivers)
+        }
+    }
+    if (host_net_ns && *host_net_ns > 0) {
+        if (get_current_net_ns_inum() == *host_net_ns) {
+            return 0; // Exempt host-NET sharing containers
+        }
+    }
+
+    struct task_struct *current_task = (struct task_struct *)bpf_get_current_task();
+    if (current_task) {
+        const struct cred *cred = BPF_CORE_READ(current_task, cred);
+        if (cred) {
+            kernel_cap_t cap_effective = BPF_CORE_READ(cred, cap_effective);
+            if (cap_effective.val & (1ULL << 21)) { // CAP_SYS_ADMIN
+                return 0; // Exempt privileged admin containers
+            }
+        }
+    }
+
+    return 1; // Restricted container process
+}
+
 static __always_inline int is_admin_session() {
     uint32_t pid = bpf_get_current_pid_tgid() >> 32;
     uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
@@ -2061,3 +2113,45 @@ int BPF_KRETPROBE(kretprobe_tty_read, int ret) {
     bpf_ringbuf_submit(ev, 0);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Container Sandboxing & Escape Prevention LSM Hooks
+// ---------------------------------------------------------------------------
+
+SEC("lsm/sb_mount")
+int BPF_PROG(warden_sb_mount, const char *dev_name, const struct path *path,
+             const char *type, unsigned long flags, void *data) {
+    if (is_container_restricted()) {
+        bpf_printk("[Warden LSM] Blocked mount attempt from restricted container namespace\n");
+        return -EPERM;
+    }
+    return 0;
+}
+
+SEC("lsm/path_chroot")
+int BPF_PROG(warden_path_chroot, const struct path *path) {
+    if (is_container_restricted()) {
+        bpf_printk("[Warden LSM] Blocked chroot attempt from restricted container namespace\n");
+        return -EPERM;
+    }
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_setns")
+int tracepoint_sys_enter_setns(void *ctx) {
+    if (is_container_restricted()) {
+        bpf_printk("[Warden LSM] Blocked setns attempt: killing container process\n");
+        bpf_send_signal(9); // SIGKILL immediately to terminate breakout
+    }
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_unshare")
+int tracepoint_sys_enter_unshare(void *ctx) {
+    if (is_container_restricted()) {
+        bpf_printk("[Warden LSM] Blocked unshare attempt: killing container process\n");
+        bpf_send_signal(9); // SIGKILL immediately
+    }
+    return 0;
+}
+
