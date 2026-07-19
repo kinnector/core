@@ -159,7 +159,7 @@ struct TelemetryEvent {
 // Map: (pid, start_time) -> category bitmask (sensitive file categories opened)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
+    __uint(max_entries, 65536);
     __type(key, struct process_key);
     __type(value, uint32_t);
 } category_flags_map SEC(".maps");
@@ -167,7 +167,7 @@ struct {
 // Map: (pid, start_time) -> pending network connect flags (non-zero = active outbound)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
+    __uint(max_entries, 65536);
     __type(key, struct process_key);
     __type(value, uint32_t);
 } pending_network_connect SEC(".maps");
@@ -175,7 +175,7 @@ struct {
 // Map: (pid, start_time) -> trusted state (1 = absolutely trusted)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 2048);
+    __uint(max_entries, 8192);
     __type(key, struct process_key);
     __type(value, uint8_t);
 } trusted_ancestor_roots SEC(".maps");
@@ -183,7 +183,7 @@ struct {
 // Map: Inode -> Category ID
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
+    __uint(max_entries, 65536);
     __type(key, uint64_t);
     __type(value, uint32_t);
 } sensitive_inodes_map SEC(".maps");
@@ -191,7 +191,7 @@ struct {
 // Map: Inode -> TrustLevel (2 = Verified, 3 = Naked TTY)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
+    __uint(max_entries, 65536);
     __type(key, uint64_t);
     __type(value, uint32_t);
 } trusted_exec_inodes SEC(".maps");
@@ -199,7 +199,7 @@ struct {
 // Map: (pid, start_time) -> threshold (1 = Untrusted, 2 = Verified, 3 = Naked TTY)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
+    __uint(max_entries, 65536);
     __type(key, struct process_key);
     __type(value, uint32_t);
 } process_threshold_map SEC(".maps");
