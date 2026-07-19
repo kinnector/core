@@ -233,11 +233,61 @@ void EbpfLoader::Stop() {
     initialized_ = false;
 }
 
+static void ApplyRamBasedMapScaling(struct bpf_object* bpf_obj) {
+    if (!bpf_obj) return;
+
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t total_ram_bytes = (uint64_t)pages * (uint64_t)page_size;
+
+    uint32_t auto_max_entries = 65536;
+    if (total_ram_bytes < 4ULL * 1024 * 1024 * 1024) {          // < 4 GB
+        auto_max_entries = 16384;
+    } else if (total_ram_bytes < 8ULL * 1024 * 1024 * 1024) {   // 4 GB - 8 GB
+        auto_max_entries = 32768;
+    } else if (total_ram_bytes < 16ULL * 1024 * 1024 * 1024) {  // 8 GB - 16 GB
+        auto_max_entries = 65536;
+    } else if (total_ram_bytes < 24ULL * 1024 * 1024 * 1024) {  // 16 GB - 24 GB
+        auto_max_entries = 131072;
+    } else if (total_ram_bytes < 32ULL * 1024 * 1024 * 1024) {  // 24 GB - 32 GB
+        auto_max_entries = 196608;
+    } else if (total_ram_bytes < 48ULL * 1024 * 1024 * 1024) {  // 32 GB - 48 GB
+        auto_max_entries = 262144;
+    } else if (total_ram_bytes < 64ULL * 1024 * 1024 * 1024) {  // 48 GB - 64 GB
+        auto_max_entries = 524288;
+    } else {                                                     // >= 64 GB
+        auto_max_entries = 1048576;
+    }
+
+    const char* maps_to_scale[] = {
+        "process_threshold_map",
+        "category_flags_map",
+        "pending_network_connect",
+        "sensitive_inodes_map",
+        "trusted_exec_inodes",
+        "exec_allowlist_map",
+        "tainted_process_map",
+        "pid_tree_type_map",
+        "db_outbound_allowlist",
+        "infra_outbound_allowlist"
+    };
+
+    for (const char* map_name : maps_to_scale) {
+        struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj, map_name);
+        if (map) {
+            bpf_map__set_max_entries(map, auto_max_entries);
+        }
+    }
+}
+
 bool EbpfLoader::LoadAndAttachLsm() {
     bpf_obj_ = bpf_object__open_file(bpf_obj_path_.c_str(), nullptr);
     if (!bpf_obj_) {
         return false;
     }
+
+    // Apply RAM-based pre-allocated map sizing before load
+    ApplyRamBasedMapScaling(bpf_obj_);
 
     // Set BPF program types dynamically to LSM
     struct bpf_program *prog;
@@ -288,6 +338,9 @@ bool EbpfLoader::LoadAndAttachFallback() {
     if (!bpf_obj_) {
         return false;
     }
+
+    // Apply RAM-based pre-allocated map sizing before load
+    ApplyRamBasedMapScaling(bpf_obj_);
 
     // Unload LSM programs (since we are in fallback, they would fail to load)
     struct bpf_program *prog;
