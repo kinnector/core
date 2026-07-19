@@ -1,0 +1,89 @@
+syntax = "proto3";
+package kinnector.warden;
+
+service WardenCloudService {
+  // Bi-directional multiplexed stream: Agent streams telemetry batches up; Cloud streams real-time admin commands down.
+  rpc StreamTelemetry (stream TelemetryBatch) returns (stream CloudControlCommand);
+
+  // Signed Rule Distribution
+  rpc SyncRules (RuleSyncRequest) returns (RuleSyncResponse);
+
+  // Configuration Synchronization
+  rpc SyncConfig (ConfigSyncRequest) returns (ConfigSyncResponse);
+}
+
+message TelemetryBatch {
+  string agent_id = 1;
+  uint64 timestamp_ns = 2;
+  uint32 bpf_capacity_pct = 3;
+  repeated AlertPayloadMessage alerts = 4;
+}
+
+message AlertPayloadMessage {
+  string alert_id = 1;
+  string timestamp = 2;
+  string threat_type = 3;
+  string severity = 4;
+  float confidence = 5;
+  ContainerInfoMessage container = 6;
+  ProcessInfoMessage process = 7;
+  RemediationInfoMessage remediation = 8;
+}
+
+message ContainerInfoMessage {
+  string container_id = 1;
+  string name = 2;
+  string image = 3;
+}
+
+message ProcessInfoMessage {
+  uint32 pid = 1;
+  string exec_path = 2;
+  string cmdline = 3;
+  string parent_exec_path = 4;
+  uint32 parent_pid = 5;
+}
+
+message RemediationInfoMessage {
+  string action = 1;
+  string status = 2;
+}
+
+message CloudControlCommand {
+  string command_id = 1;
+  enum Action {
+    NONE = 0;
+    MAINTENANCE_ENABLE = 1;
+    MAINTENANCE_DISABLE = 2;
+    RELOAD_RULES = 3;
+    RESTART_AGENT = 4;
+  }
+  Action action = 2;
+  uint32 maintenance_duration_mins = 3;
+  string reason = 4;
+  string payload_json = 5;
+}
+
+message RuleSyncRequest {
+  string agent_id = 1;
+  string license_key = 2;
+  string current_etag = 3;
+}
+
+message RuleSyncResponse {
+  bool updated = 1;
+  string new_etag = 2;
+  bytes signature = 3;
+  bytes rules_bundle = 4;
+}
+
+message ConfigSyncRequest {
+  string agent_id = 1;
+  string license_key = 2;
+  string current_config_hash = 3;
+}
+
+message ConfigSyncResponse {
+  bool updated = 1;
+  string config_json = 2;
+}
