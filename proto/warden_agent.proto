@@ -5,11 +5,38 @@ service WardenCloudService {
   // Bi-directional multiplexed stream: Agent streams telemetry batches up; Cloud streams real-time admin commands down.
   rpc StreamTelemetry (stream TelemetryBatch) returns (stream CloudControlCommand);
 
+  // Agent Device Registration & Capabilities Telemetry
+  rpc RegisterAgent (RegisterRequest) returns (RegisterResponse);
+
   // Signed Rule Distribution
   rpc SyncRules (RuleSyncRequest) returns (RuleSyncResponse);
 
   // Configuration Synchronization
   rpc SyncConfig (ConfigSyncRequest) returns (ConfigSyncResponse);
+}
+
+message RegisterRequest {
+  string agent_id = 1;
+  string license_key = 2;
+  string warden_version = 3;
+  string core_version = 4;
+  string hostname = 5;
+  string distro = 6;
+  string kernel_version = 7;
+  string lsm_supported = 8;
+  string grub_cmdline = 9;
+  uint32 ram_total_gb = 10;
+}
+
+message RegisterResponse {
+  enum Verdict {
+    ALLOW = 0;
+    DENY = 1;
+    UPDATE_REQUIRED = 2;
+  }
+  Verdict verdict = 1;
+  string message = 2;
+  bool update_required = 3;
 }
 
 message TelemetryBatch {
