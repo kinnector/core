@@ -1575,6 +1575,19 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm) {
 
     struct file *bprm_file = BPF_CORE_READ(bprm, file);
     if (bprm_file) {
+        // Block memfd execution for monitored processes / install contexts
+        struct dentry *dentry = BPF_CORE_READ(bprm_file, f_path.dentry);
+        if (dentry) {
+            struct qstr d_name = BPF_CORE_READ(dentry, d_name);
+            char name[16] = {0};
+            bpf_probe_read_kernel_str(name, sizeof(name), d_name.name);
+            if (name[0] == 'm' && name[1] == 'e' && name[2] == 'm' && name[3] == 'f' && name[4] == 'd' && name[5] == ':') {
+                if (thresh_val > 0 || is_install_session()) {
+                    return -EACCES;
+                }
+            }
+        }
+
         struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
         if (inode) {
             uint64_t ino = BPF_CORE_READ(inode, i_ino);
