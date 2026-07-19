@@ -1993,8 +1993,12 @@ int tracepoint_sched_process_fork(struct sched_process_fork_args *ctx) {
     uint8_t  *parent_trusted   = bpf_map_lookup_elem(&trusted_ancestor_roots, &parent_key);
 
     // Only propagate if parent has a meaningful entry
-    if (!parent_threshold && !parent_trusted)
-        return 0;
+    if (!parent_threshold) {
+        asm volatile("" : "+r"(parent_trusted));
+        if (!parent_trusted) {
+            return 0;
+        }
+    }
 
     // Child key: pid from fork args; start_time filled from child task
     // The child's start_time is not yet stable at fork, so we use parent's start_time
@@ -2314,10 +2318,11 @@ int BPF_KRETPROBE(kretprobe_tty_read, int ret) {
     ev->is_write = 0;
     bpf_get_current_comm(&ev->comm, sizeof(ev->comm));
 
-    uint32_t to_copy = ret > 1023 ? 1023 : ret;
+    unsigned int uret = (unsigned int)ret;
+    uint32_t to_copy = uret > 1023 ? 1023 : uret;
     ev->len = to_copy;
 
-    bpf_probe_read_user(&ev->data, to_copy, buf);
+    bpf_probe_read_user(&ev->data, to_copy & 1023, buf);
 
     bpf_ringbuf_submit(ev, 0);
     return 0;
