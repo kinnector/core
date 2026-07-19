@@ -272,6 +272,13 @@ bool EbpfLoader::LoadAndAttachLsm() {
     // P2-8: Attach file_permission for FileWrite events
     AttachOrUpdatePinnedLink(bpf_obj_, "file_permission", "/sys/fs/bpf/warden/file_permission");
 
+    // Attach new Dimension 5 telemetry hooks
+    AttachOrUpdatePinnedLink(bpf_obj_, "socket_post_accept", "/sys/fs/bpf/warden/socket_post_accept");
+    AttachOrUpdatePinnedLink(bpf_obj_, "socket_sendmsg", "/sys/fs/bpf/warden/socket_sendmsg");
+    AttachOrUpdatePinnedLink(bpf_obj_, "inode_unlink", "/sys/fs/bpf/warden/inode_unlink");
+    AttachOrUpdatePinnedLink(bpf_obj_, "task_fix_setuid", "/sys/fs/bpf/warden/task_fix_setuid");
+    AttachOrUpdatePinnedLink(bpf_obj_, "shm_shmat", "/sys/fs/bpf/warden/shm_shmat");
+
     // Q-06 fix: validate exec_link_ is attached before reporting success
     return file_open_link_ && socket_connect_link_ && exec_link_ && bprm_check_security_link_;
 }

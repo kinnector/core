@@ -356,6 +356,13 @@ struct {
     __type(value, struct tty_read_req);
 } pending_tty_reads SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, uint64_t);
+    __type(value, uint64_t);
+} dns_cache_map SEC(".maps");
+
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1704,7 +1711,28 @@ int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int 
         int is_sender_admin = (sender_tree && (*sender_tree & TREE_ADMIN_SESSION));
 
         if (!is_sender_warden && !is_sender_admin) {
+            struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+            if (event) {
+                fill_header(event, 23, SRC_BPF_LSM, current_pid); // EVT_SIGNAL_DELIVERY = 23
+                bpf_probe_read_kernel(event->details.details_buffer, 4, &target_pid);
+                bpf_probe_read_kernel(event->details.details_buffer + 4, 4, &sig);
+                bpf_ringbuf_submit(event, 0);
+            }
             return -EPERM; // Deny signal delivery!
+        }
+    }
+
+    if (sig == 9 || sig == 19) {
+        struct process_key key = get_current_process_key();
+        uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+        if (threshold) {
+            struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+            if (event) {
+                fill_header(event, 23, SRC_BPF_LSM, current_pid); // EVT_SIGNAL_DELIVERY = 23
+                bpf_probe_read_kernel(event->details.details_buffer, 4, &target_pid);
+                bpf_probe_read_kernel(event->details.details_buffer + 4, 4, &sig);
+                bpf_ringbuf_submit(event, 0);
+            }
         }
     }
 
@@ -2365,6 +2393,204 @@ int tracepoint_sys_enter_unshare(void *ctx) {
     if (is_container_restricted()) {
         bpf_printk("[Warden LSM] Blocked unshare attempt: killing container process\n");
         bpf_send_signal(9); // SIGKILL immediately
+    }
+    return 0;
+}
+
+#ifndef bpf_ntohs
+#define bpf_ntohs(x) (uint16_t)(((uint16_t)(x) >> 8) | ((uint16_t)(x) << 8))
+#endif
+#ifndef bpf_htons
+#define bpf_htons(x) (uint16_t)(((uint16_t)(x) >> 8) | ((uint16_t)(x) << 8))
+#endif
+
+SEC("lsm/socket_post_accept")
+int BPF_PROG(socket_post_accept, struct socket *sock, struct socket *newsock, int flags) {
+    if (!newsock || !newsock->sk) return 0;
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct process_key key = get_current_process_key();
+    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (!threshold) return 0;
+
+    struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+    if (event) {
+        fill_header(event, 20, SRC_BPF_LSM, pid); // EVT_NETWORK_ACCEPT = 20
+        struct sock *sk = newsock->sk;
+        uint16_t family = BPF_CORE_READ(sk, __sk_common.skc_family);
+        event->details.details_buffer[0] = 0;
+
+        uint16_t dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+        uint16_t sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+        bpf_probe_read_kernel(event->details.details_buffer + 46, 2, &dport);
+        bpf_probe_read_kernel(event->details.details_buffer + 48, 2, &sport);
+
+        if (family == 2) {
+            uint32_t src_ip = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+            unsigned char *b = (unsigned char *)&src_ip;
+            event->details.details_buffer[0] = 0x04;
+            event->details.details_buffer[1] = b[0];
+            event->details.details_buffer[2] = b[1];
+            event->details.details_buffer[3] = b[2];
+            event->details.details_buffer[4] = b[3];
+            event->details.details_buffer[5] = 0;
+        } else if (family == 10) {
+            event->details.details_buffer[0] = 0x06;
+            bpf_probe_read_kernel(event->details.details_buffer + 1, 16, &sk->__sk_common.skc_v6_daddr);
+            event->details.details_buffer[17] = 0;
+        }
+        bpf_ringbuf_submit(event, 0);
+    }
+    return 0;
+}
+
+SEC("lsm/socket_sendmsg")
+int BPF_PROG(socket_sendmsg, struct socket *sock, struct msghdr *msg, int size) {
+    if (!sock || !sock->sk || !msg) return 0;
+    struct sock *sk = sock->sk;
+    uint16_t family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    uint16_t type = BPF_CORE_READ(sock, type);
+    if (type != 2) return 0; // SOCK_DGRAM = 2
+
+    struct sockaddr *address = BPF_CORE_READ(msg, msg_name);
+    if (!address) return 0;
+
+    uint16_t dest_port = 0;
+    if (family == 2) {
+        struct sockaddr_in sin;
+        bpf_probe_read_kernel(&sin, sizeof(sin), address);
+        dest_port = bpf_ntohs(sin.sin_port);
+    } else if (family == 10) {
+        struct sockaddr_in6 sin6;
+        bpf_probe_read_kernel(&sin6, sizeof(sin6), address);
+        dest_port = bpf_ntohs(sin6.sin6_port);
+    }
+
+    if (dest_port != 53) return 0;
+
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+    struct process_key key = get_current_process_key();
+    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (!threshold) return 0;
+
+    void *user_buf = 0;
+    uint8_t iter_type = BPF_CORE_READ(msg, msg_iter.iter_type);
+    if (iter_type == 4) { // ITER_UBUF
+        user_buf = BPF_CORE_READ(msg, msg_iter.ubuf);
+    } else {
+        const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
+        if (iov) {
+            user_buf = BPF_CORE_READ(iov, iov_base);
+        }
+    }
+    if (!user_buf) return 0;
+
+    char raw_qname[128];
+    bpf_probe_read_user(raw_qname, sizeof(raw_qname), (char *)user_buf + 12);
+
+    uint64_t qname_hash = 0;
+    bpf_probe_read_kernel(&qname_hash, sizeof(qname_hash), raw_qname);
+    if (qname_hash != 0) {
+        uint64_t *cached = bpf_map_lookup_elem(&dns_cache_map, &qname_hash);
+        if (cached) {
+            return 0; // already seen, exit early!
+        }
+        uint64_t ts = bpf_ktime_get_ns();
+        bpf_map_update_elem(&dns_cache_map, &qname_hash, &ts, BPF_ANY);
+    }
+
+    struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+    if (event) {
+        fill_header(event, 21, SRC_BPF_LSM, pid); // EVT_DNS_QUERY = 21
+        bpf_probe_read_kernel(event->details.details_buffer, 128, raw_qname);
+
+        uint16_t dport_be = bpf_htons(dest_port);
+        bpf_probe_read_kernel(event->details.details_buffer + 174, 2, &dport_be);
+
+        if (family == 2) {
+            struct sockaddr_in sin;
+            bpf_probe_read_kernel(&sin, sizeof(sin), address);
+            uint32_t src_ip = sin.sin_addr.s_addr;
+            unsigned char *b = (unsigned char *)&src_ip;
+            event->details.details_buffer[128] = 0x04;
+            event->details.details_buffer[129] = b[0];
+            event->details.details_buffer[130] = b[1];
+            event->details.details_buffer[131] = b[2];
+            event->details.details_buffer[132] = b[3];
+            event->details.details_buffer[133] = 0;
+        } else if (family == 10) {
+            struct sockaddr_in6 sin6;
+            bpf_probe_read_kernel(&sin6, sizeof(sin6), address);
+            event->details.details_buffer[128] = 0x06;
+            bpf_probe_read_kernel(event->details.details_buffer + 129, 16, &sin6.sin6_addr);
+            event->details.details_buffer[145] = 0;
+        }
+        bpf_ringbuf_submit(event, 0);
+    }
+    return 0;
+}
+
+SEC("lsm/inode_unlink")
+int BPF_PROG(inode_unlink, struct inode *dir, struct dentry *dentry) {
+    if (!dentry) return 0;
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct process_key key = get_current_process_key();
+    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (!threshold) return 0;
+
+    struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+    if (event) {
+        fill_header(event, 22, SRC_BPF_LSM, pid); // EVT_FILE_DELETE = 22
+        struct qstr d_name = BPF_CORE_READ(dentry, d_name);
+        bpf_probe_read_kernel_str(event->details.details_buffer, 512, d_name.name);
+        bpf_ringbuf_submit(event, 0);
+    }
+    return 0;
+}
+
+SEC("lsm/task_fix_setuid")
+int BPF_PROG(task_fix_setuid, struct cred *new_cred, const struct cred *old_cred, int flags) {
+    if (!new_cred || !old_cred) return 0;
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct process_key key = get_current_process_key();
+    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (!threshold) return 0;
+
+    uint32_t new_uid = BPF_CORE_READ(new_cred, uid.val);
+    uint32_t old_uid = BPF_CORE_READ(old_cred, uid.val);
+
+    if (new_uid != old_uid) {
+        struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+        if (event) {
+            fill_header(event, 24, SRC_BPF_LSM, pid); // EVT_PRIVILEGE_CHANGE = 24
+            bpf_probe_read_kernel(event->details.details_buffer, 4, &old_uid);
+            bpf_probe_read_kernel(event->details.details_buffer + 4, 4, &new_uid);
+            bpf_ringbuf_submit(event, 0);
+        }
+    }
+    return 0;
+}
+
+SEC("lsm/shm_shmat")
+int BPF_PROG(shm_shmat, struct shmid_kernel *shp, char *shmaddr, int shmflg) {
+    if (!shp) return 0;
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct process_key key = get_current_process_key();
+    uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (!threshold) return 0;
+
+    int32_t shmid = BPF_CORE_READ(shp, shm_perm.id);
+    uint32_t creator_uid = BPF_CORE_READ(shp, shm_perm.cuid.val);
+
+    struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+    if (event) {
+        fill_header(event, 25, SRC_BPF_LSM, pid); // EVT_IPC_ACCESS = 25
+        bpf_probe_read_kernel(event->details.details_buffer, 4, &shmid);
+        bpf_probe_read_kernel(event->details.details_buffer + 4, 4, &creator_uid);
+        bpf_ringbuf_submit(event, 0);
     }
     return 0;
 }

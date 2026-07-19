@@ -20,7 +20,17 @@ enum class EventType : uint8_t {
     MemoryProtect = 12,
     PtraceAttach = 13,
     SSHAuth = 14,
-    TerminalCommand = 15
+    TerminalCommand = 15,
+    FileOpen = 16,
+    MemoryMap = 17,
+    Dup2 = 18,
+    Listen = 19,
+    NetworkAccept = 20,
+    DNSQuery = 21,
+    FileDelete = 22,
+    SignalDelivery = 23,
+    PrivilegeChange = 24,
+    IPCAccess = 25
 };
 
 enum class TelemetrySource : uint8_t {
