@@ -9,6 +9,8 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+enable_testing()
+
 
 
 # Common source files
@@ -114,12 +116,42 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_dependencies(kinnector-core ebpf_target)
         add_dependencies(kinnector-core-shared ebpf_target)
     endif()
-    # Add test executable
+    # Add test executables
     add_executable(kinnector-test-ipc src/linux/test_ipc.cpp)
     target_link_libraries(kinnector-test-ipc PRIVATE kinnector-core)
+    add_test(NAME test_ipc COMMAND kinnector-test-ipc)
 
     add_executable(kinnector-test-lsm src/linux/test_lsm.cpp)
     target_link_libraries(kinnector-test-lsm PRIVATE kinnector-core)
+    add_test(NAME test_lsm COMMAND kinnector-test-lsm)
+
+    add_executable(kinnector-test-telemetry src/linux/test_telemetry.cpp)
+    target_link_libraries(kinnector-test-telemetry PRIVATE kinnector-core)
+    add_test(NAME test_telemetry COMMAND kinnector-test-telemetry)
+
+    add_executable(kinnector-test-warden-helper src/linux/test_warden_helper.cpp)
+    target_link_libraries(kinnector-test-warden-helper PRIVATE kinnector-core)
+    add_test(NAME test_warden_helper COMMAND kinnector-test-warden-helper)
+
+    add_executable(kinnector-test-fanotify src/linux/test_fanotify.cpp)
+    target_link_libraries(kinnector-test-fanotify PRIVATE kinnector-core)
+    add_test(NAME test_fanotify COMMAND kinnector-test-fanotify)
+
+    add_executable(kinnector-test-ebpf-loader src/linux/test_ebpf_loader.cpp)
+    target_link_libraries(kinnector-test-ebpf-loader PRIVATE kinnector-core)
+    add_test(NAME test_ebpf_loader COMMAND kinnector-test-ebpf-loader)
+
+    add_executable(kinnector-test-linux-ipc src/linux/test_linux_ipc.cpp)
+    target_link_libraries(kinnector-test-linux-ipc PRIVATE kinnector-core)
+    add_test(NAME test_linux_ipc COMMAND kinnector-test-linux-ipc)
+
+    add_executable(kinnector-test-ffi src/linux/test_ffi.cpp)
+    target_link_libraries(kinnector-test-ffi PRIVATE kinnector-core)
+    add_test(NAME test_ffi COMMAND kinnector-test-ffi)
+
+    add_executable(kinnector-test-warden-all src/linux/test_warden_all.cpp)
+    target_link_libraries(kinnector-test-warden-all PRIVATE kinnector-core)
+    add_test(NAME test_warden_all COMMAND kinnector-test-warden-all)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")

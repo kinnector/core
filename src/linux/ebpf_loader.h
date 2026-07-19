@@ -105,6 +105,7 @@ private:
     struct bpf_link* socket_connect_link_{nullptr};
     struct bpf_link* socket_listen_link_{nullptr};
     struct bpf_link* exec_link_{nullptr};
+    struct bpf_link* bprm_check_security_link_{nullptr};
     struct bpf_link* ptrace_link_{nullptr};
     struct bpf_link* mprotect_link_{nullptr};
     struct bpf_link* task_kill_link_{nullptr};

@@ -31,6 +31,7 @@ KINNECTOR_API void stop_telemetry_engine();
 // Populate sensitive inode category mappings
 KINNECTOR_API bool add_sensitive_inode(uint64_t inode, uint32_t category);
 KINNECTOR_API bool add_protected_static_inode(uint64_t inode);
+KINNECTOR_API bool remove_protected_static_inode(uint64_t inode);
 
 // Register a directory inode as a DB data-dir bypass (suppresses telemetry for DB processes)
 KINNECTOR_API bool add_bypassed_directory_inode(uint64_t inode);
@@ -40,6 +41,7 @@ KINNECTOR_API bool remove_bypassed_directory_inode(uint64_t inode);
 
 // Populate trusted executable inodes mappings
 KINNECTOR_API bool add_trusted_exec_inode(uint64_t inode, uint32_t trust_level);
+KINNECTOR_API bool is_trusted_exec_inode(uint64_t inode);
 
 // Set configuration variables (e.g. blocking mode enabled)
 KINNECTOR_API bool set_config_value(uint32_t index, uint32_t value);

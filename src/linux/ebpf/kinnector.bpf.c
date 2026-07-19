@@ -1503,6 +1503,65 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
     return 0;
 }
 
+SEC("lsm/bprm_check_security")
+int BPF_PROG(bprm_check_security, struct linux_binprm *bprm) {
+    if (!bprm)
+        return 0;
+
+    // Check config/blocking mode
+    uint32_t config_idx = 0;
+    uint32_t *mode = bpf_map_lookup_elem(&config_map, &config_idx);
+    uint32_t blocking_enabled = (mode && *mode == 1);
+    if (!blocking_enabled)
+        return 0;
+
+    // Bypass for admin sessions (unless it is install context)
+    if (is_admin_session() && !is_install_session()) {
+        return 0;
+    }
+
+    struct process_key key = get_current_process_key();
+    uint32_t *active_threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+    if (!active_threshold) {
+        return 0;
+    }
+
+    uint32_t thresh_val = *active_threshold;
+
+    struct file *bprm_file = BPF_CORE_READ(bprm, file);
+    if (bprm_file) {
+        struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
+        if (inode) {
+            uint64_t ino = BPF_CORE_READ(inode, i_ino);
+            
+            // Re-validate against newly_created_inodes (untrusted/tampered)
+            uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &ino);
+            if (is_newly_created && *is_newly_created == 1) {
+                if (thresh_val > 0) {
+                    if (!is_install_session()) {
+                        return -EACCES;
+                    }
+                }
+            }
+
+            // PROFILE_ZERO_EXECUTION: unconditionally deny execution
+            if (thresh_val & PROFILE_ZERO_EXECUTION) {
+                return -EACCES;
+            }
+
+            // PROFILE_RESTRICTED_EXEC: check exec_allowlist_map
+            if (thresh_val & PROFILE_RESTRICTED_EXEC) {
+                uint8_t *allowed = bpf_map_lookup_elem(&exec_allowlist_map, &ino);
+                if (!allowed || *allowed != 1) {
+                    return -EACCES; // Deny execution of unapproved binary
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 SEC("lsm/ptrace_access_check")
 int BPF_PROG(ptrace_access_check, struct task_struct *child, unsigned int mode) {
     if (!child) return 0;
@@ -1730,7 +1789,7 @@ int BPF_PROG(path_chmod, const struct path *path, umode_t mode) {
     // If setting any executable permission bits (S_IXUSR, S_IXGRP, S_IXOTH)
     if (mode & (0100 | 0010 | 0001)) {
         struct process_key key = get_current_process_key();
-        uint8_t *active_threshold = bpf_map_lookup_elem(&process_thresholds, &key);
+        uint32_t *active_threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
         if (!active_threshold || *active_threshold == 0) {
             return 0; // Not a monitored process, allow chmod
         }

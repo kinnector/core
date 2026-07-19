@@ -182,6 +182,7 @@ void EbpfLoader::Stop() {
     CleanPinnedLink(socket_connect_link_);
     CleanPinnedLink(socket_listen_link_);
     CleanPinnedLink(exec_link_);
+    CleanPinnedLink(bprm_check_security_link_);
     CleanPinnedLink(ptrace_link_);
     CleanPinnedLink(kprobe_tty_write_link_);
     CleanPinnedLink(kprobe_tty_read_link_);
@@ -206,6 +207,7 @@ void EbpfLoader::Stop() {
     socket_connect_link_ = nullptr;
     socket_listen_link_  = nullptr;
     exec_link_           = nullptr;
+    bprm_check_security_link_ = nullptr;
     ptrace_link_         = nullptr;
     kprobe_tty_write_link_ = nullptr;
     kprobe_tty_read_link_  = nullptr;
@@ -261,6 +263,7 @@ bool EbpfLoader::LoadAndAttachLsm() {
     socket_connect_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "socket_connect", "/sys/fs/bpf/warden/socket_connect");
     socket_listen_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "socket_listen", "/sys/fs/bpf/warden/socket_listen");
     exec_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "bprm_creds_for_exec", "/sys/fs/bpf/warden/bprm_creds_for_exec");
+    bprm_check_security_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "bprm_check_security", "/sys/fs/bpf/warden/bprm_check_security");
     ptrace_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "ptrace_access_check", "/sys/fs/bpf/warden/ptrace_access_check");
     mprotect_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "file_mprotect", "/sys/fs/bpf/warden/file_mprotect");
     task_kill_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "task_kill", "/sys/fs/bpf/warden/task_kill");
@@ -270,7 +273,7 @@ bool EbpfLoader::LoadAndAttachLsm() {
     AttachOrUpdatePinnedLink(bpf_obj_, "file_permission", "/sys/fs/bpf/warden/file_permission");
 
     // Q-06 fix: validate exec_link_ is attached before reporting success
-    return file_open_link_ && socket_connect_link_ && exec_link_;
+    return file_open_link_ && socket_connect_link_ && exec_link_ && bprm_check_security_link_;
 }
 
 bool EbpfLoader::LoadAndAttachFallback() {

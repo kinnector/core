@@ -28,6 +28,11 @@ int main() {
     std::cout << "  - LSM Active: " << (loader.IsLsmActive() ? "YES" : "NO") << std::endl;
     std::cout << "  - Mock Mode: " << (loader.IsMockMode() ? "YES" : "NO") << std::endl;
 
+    if (!loader.IsLsmActive()) {
+        std::cerr << "Test failed: BPF LSM is NOT active in the kernel." << std::endl;
+        return 1;
+    }
+
     // Test map insertion
     std::cout << "Testing Map integration (CategoryFlags map)..." << std::endl;
     uint32_t test_pid = 99999;

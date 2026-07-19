@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "fanotify.h"
 #include <sys/fanotify.h>
 #include <fcntl.h>
@@ -126,6 +127,7 @@ void FanotifyMonitor::MonitorLoop() {
 
                     // Filter out noisy paths to prevent feedback loops and system noise
                     bool should_filter = path_str.empty() ||
+                                         path_str.find(mount_path_) != 0 ||
                                          path_str.find("/proc/") == 0 ||
                                          path_str.find("/sys/") == 0 ||
                                          path_str.find("/dev/") == 0 ||
