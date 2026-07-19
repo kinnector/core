@@ -561,6 +561,51 @@ int BPF_PROG(file_open, struct file *file, int mask) {
 
     struct process_key key = get_current_process_key();
 
+    // Block cross-process /proc/<PID>/fd/ access (pidfd_getfd / LFI attack path)
+    {
+        struct path f_path = BPF_CORE_READ(file, f_path);
+        struct dentry *dentry = f_path.dentry;
+        if (dentry) {
+            struct dentry *parent = BPF_CORE_READ(dentry, d_parent);
+            if (parent) {
+                struct qstr p_name = BPF_CORE_READ(parent, d_name);
+                char p_str[8] = {0};
+                bpf_probe_read_kernel_str(p_str, sizeof(p_str), p_name.name);
+                if (p_str[0] == 'f' && p_str[1] == 'd' && p_str[2] == '\0') {
+                    struct dentry *grandparent = BPF_CORE_READ(parent, d_parent);
+                    if (grandparent) {
+                        struct qstr gp_name = BPF_CORE_READ(grandparent, d_name);
+                        char gp_str[16] = {0};
+                        bpf_probe_read_kernel_str(gp_str, sizeof(gp_str), gp_name.name);
+                        
+                        uint32_t gp_pid = 0;
+                        bool is_numeric = true;
+                        #pragma unroll
+                        for (int i = 0; i < 10; i++) {
+                            char c = gp_str[i];
+                            if (c == '\0') break;
+                            if (c >= '0' && c <= '9') {
+                                gp_pid = gp_pid * 10 + (c - '0');
+                            } else {
+                                is_numeric = false;
+                                break;
+                            }
+                        }
+
+                        if (is_numeric && gp_pid > 0 && gp_pid != key.pid) {
+                            uint32_t *active_threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+                            if (active_threshold && *active_threshold > 0) {
+                                if (!is_admin_session() || is_install_session()) {
+                                    return -EACCES;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // SSHD Pre-Auth Zero-Trust Lockdown:
     // If the process is running under the unprivileged sshd user's UID,
     // deny reading files in sensitive folders (home, root, www, opt, srv, etc.).
