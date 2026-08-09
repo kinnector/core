@@ -119,7 +119,7 @@ struct TelemetryEvent {
 #define EVT_MEMORY_PROTECT  12
 #define EVT_DUP2            18
 #define EVT_LISTEN          19
-
+#define EVT_FILE_BATCH      26
 
 
 // TelemetrySource constants
@@ -323,6 +323,37 @@ struct {
     __type(value, uint64_t);
 } seq_counter SEC(".maps");
 
+struct fs_batch_key {
+    uint32_t pid;
+    uint32_t op_type; // 1 = READ, 2 = WRITE, 3 = DELETE, 4 = MMAP_EXEC, 5 = EXEC, 6 = SYSCALL
+    uint64_t inode;
+};
+
+struct fs_batch_value {
+    uint64_t count;
+    uint64_t last_flush;
+    char file_path[256];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct fs_batch_key);
+    __type(value, struct fs_batch_value);
+} fs_batch_map SEC(".maps");
+
+struct scratch_buf {
+    char path[256];
+    struct fs_batch_value new_val;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct scratch_buf);
+} scratch_map SEC(".maps");
+
 // Ring buffer for sending events to kinnect-agent
 // P2-12: Increased to 16MB to reduce event loss under high load
 struct {
@@ -500,6 +531,7 @@ static __always_inline int is_install_session() {
     return 0;
 }
 
+
 static __always_inline bool is_install_binary(const char *name) {
     #pragma unroll
     for (int i = 0; i < 90; i++) {
@@ -557,7 +589,99 @@ static __always_inline void fill_header(struct TelemetryEvent *ev,
     ev->header.source          = source;
 }
 
-// ---------------------------------------------------------------------------
+static __always_inline void format_ip_port(char *buf, unsigned char *b, uint16_t port) {
+    int offset = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        unsigned char val = b[i];
+        if (val >= 100) {
+            buf[offset++] = '0' + (val / 100);
+            buf[offset++] = '0' + ((val % 100) / 10);
+            buf[offset++] = '0' + (val % 10);
+        } else if (val >= 10) {
+            buf[offset++] = '0' + (val / 10);
+            buf[offset++] = '0' + (val % 10);
+        } else {
+            buf[offset++] = '0' + val;
+        }
+        if (i < 3) {
+            buf[offset++] = '.';
+        }
+    }
+    buf[offset++] = ':';
+
+    uint16_t p = port;
+    char port_digits[5];
+    port_digits[4] = '0' + (p % 10); p /= 10;
+    port_digits[3] = '0' + (p % 10); p /= 10;
+    port_digits[2] = '0' + (p % 10); p /= 10;
+    port_digits[1] = '0' + (p % 10); p /= 10;
+    port_digits[0] = '0' + (p % 10);
+
+    bool leading_zero = true;
+    #pragma unroll
+    for (int i = 0; i < 5; i++) {
+        if (leading_zero && port_digits[i] == '0' && i < 4) {
+            // skip
+        } else {
+            leading_zero = false;
+            buf[offset++] = port_digits[i];
+        }
+    }
+    buf[offset] = '\0';
+}
+
+static __always_inline void record_and_batch_event(uint32_t op_type, struct file *file, uint64_t ino, const char *direct_name) {
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct fs_batch_key key = {0};
+    key.pid = pid;
+    key.op_type = op_type;
+    key.inode = ino;
+
+    struct fs_batch_value *val = bpf_map_lookup_elem(&fs_batch_map, &key);
+    uint64_t now = bpf_ktime_get_ns();
+
+    if (val) {
+        val->count++;
+        // If 1 second (1,000,000,000 ns) has passed since last flush, or count > 500
+        if (now - val->last_flush > 1000000000ULL || val->count > 500) {
+            struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+            if (event) {
+                fill_header(event, EVT_FILE_BATCH, SRC_BPF_LSM, pid);
+                uint32_t *op_ptr = (uint32_t *)&event->details.details_buffer[0];
+                uint32_t *cnt_ptr = (uint32_t *)&event->details.details_buffer[4];
+                char *path_ptr = (char *)&event->details.details_buffer[8];
+
+                *op_ptr = op_type;
+                *cnt_ptr = (uint32_t)val->count;
+                bpf_probe_read_kernel(path_ptr, 256, val->file_path);
+
+                bpf_ringbuf_submit(event, 0);
+            }
+            val->count = 0;
+            val->last_flush = now;
+        }
+    } else {
+        uint32_t zero = 0;
+        struct scratch_buf *buf = bpf_map_lookup_elem(&scratch_map, &zero);
+        if (buf) {
+            __builtin_memset(&buf->new_val, 0, sizeof(buf->new_val));
+            buf->new_val.count = 1;
+            buf->new_val.last_flush = now;
+            if (file) {
+                struct qstr d_name;
+                bpf_probe_read_kernel(&d_name, sizeof(d_name), &BPF_CORE_READ(file, f_path.dentry)->d_name);
+                bpf_probe_read_kernel_str(buf->new_val.file_path, sizeof(buf->new_val.file_path), d_name.name);
+            } else if (direct_name) {
+                bpf_probe_read_kernel_str(buf->new_val.file_path, sizeof(buf->new_val.file_path), direct_name);
+            }
+            bpf_map_update_elem(&fs_batch_map, &key, &buf->new_val, BPF_ANY);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 // BPF LSM Hooks
 // ---------------------------------------------------------------------------
 
@@ -870,6 +994,14 @@ int BPF_PROG(file_open, struct file *file, int mask) {
         bpf_ringbuf_submit(event, 0);
     }
 
+    if (is_install_session() || is_admin_session()) {
+        struct inode *inode = BPF_CORE_READ(file, f_inode);
+        if (inode) {
+            uint64_t ino = BPF_CORE_READ(inode, i_ino);
+            record_and_batch_event(1, file, ino, NULL); // 1 = READ
+        }
+    }
+
     return 0;
 }
 
@@ -947,6 +1079,14 @@ int BPF_PROG(file_permission, struct file *file, int mask) {
         bpf_probe_read_kernel_str(&event->details.file_write.file_path,
                                   sizeof(event->details.file_write.file_path), d_name.name);
         bpf_ringbuf_submit(event, 0);
+    }
+
+    if (is_install_session() || is_admin_session()) {
+        struct inode *inode = BPF_CORE_READ(file, f_inode);
+        if (inode) {
+            uint64_t ino = BPF_CORE_READ(inode, i_ino);
+            record_and_batch_event(2, file, ino, NULL); // 2 = WRITE
+        }
     }
 
     return 0;
@@ -1192,6 +1332,30 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
         event->details.network_connect.protocol[3] = 0;
 
         bpf_ringbuf_submit(event, 0);
+    }
+
+    if (is_install_session() || is_admin_session()) {
+        uint32_t zero = 0;
+        struct scratch_buf *buf = bpf_map_lookup_elem(&scratch_map, &zero);
+        if (buf) {
+            uint16_t dest_port = 0;
+            uint32_t dest_ip = 0;
+            if (family == 2) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)address;
+                uint16_t port_be = 0;
+                bpf_probe_read_kernel(&port_be, sizeof(port_be), &sin->sin_port);
+                dest_port = ((port_be & 0xFF) << 8) | ((port_be >> 8) & 0xFF);
+                bpf_probe_read_kernel(&dest_ip, sizeof(dest_ip), &sin->sin_addr.s_addr);
+
+                unsigned char *b = (unsigned char *)&dest_ip;
+                format_ip_port(buf->path, b, dest_port);
+                record_and_batch_event(7, NULL, dest_port, buf->path); // 7 = NETWORK_CONNECT
+            } else if (family == 10) {
+                record_and_batch_event(7, NULL, 0, "[IPv6 connection]");
+            } else {
+                record_and_batch_event(7, NULL, 0, "[Unix socket connection]");
+            }
+        }
     }
 
     return 0;
@@ -1624,6 +1788,15 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm) {
         }
     }
 
+    if (is_install_session() || is_admin_session()) {
+        struct file *bprm_file = BPF_CORE_READ(bprm, file);
+        if (bprm_file) {
+            struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
+            uint64_t ino = inode ? BPF_CORE_READ(inode, i_ino) : 0;
+            record_and_batch_event(5, bprm_file, ino, NULL); // 5 = EXEC
+        }
+    }
+
     return 0;
 }
 
@@ -1801,6 +1974,17 @@ int BPF_PROG(file_mprotect, struct vm_area_struct *vma,
         bpf_ringbuf_submit(event, 0);
     }
 
+    if (is_install_session() || is_admin_session()) {
+        struct file *vm_file = BPF_CORE_READ(vma, vm_file);
+        if (vm_file) {
+            struct inode *inode = BPF_CORE_READ(vm_file, f_inode);
+            uint64_t ino = inode ? BPF_CORE_READ(inode, i_ino) : 0;
+            record_and_batch_event(4, vm_file, ino, NULL); // 4 = MMAP_EXEC (file-backed)
+        } else {
+            record_and_batch_event(4, NULL, 0, "[anonymous]"); // 4 = MMAP_EXEC (anonymous)
+        }
+    }
+
     return 0;
 }
 
@@ -1855,6 +2039,13 @@ int BPF_PROG(mmap_file, struct file *file, unsigned long reqprot,
     }
 
     bpf_ringbuf_submit(event, 0);
+
+    if (is_install_session() || is_admin_session()) {
+        struct inode *inode = BPF_CORE_READ(file, f_inode);
+        uint64_t ino = inode ? BPF_CORE_READ(inode, i_ino) : 0;
+        record_and_batch_event(4, file, ino, NULL); // 4 = MMAP_EXEC
+    }
+
     return 0;
 }
 
@@ -2227,6 +2418,11 @@ int tracepoint_sys_enter_dup2(struct sys_enter_dup2_args *ctx) {
         event->details.dup2.newfd = ctx->newfd;
         bpf_ringbuf_submit(event, 0);
     }
+
+    if (is_install_session() || is_admin_session()) {
+        record_and_batch_event(6, NULL, 0, "[dup2]"); // 6 = SYSCALL
+    }
+
     return 0;
 }
 
@@ -2249,6 +2445,11 @@ int tracepoint_sys_enter_dup3(struct sys_enter_dup3_args *ctx) {
         event->details.dup2.newfd = ctx->newfd;
         bpf_ringbuf_submit(event, 0);
     }
+
+    if (is_install_session() || is_admin_session()) {
+        record_and_batch_event(6, NULL, 0, "[dup3]"); // 6 = SYSCALL
+    }
+
     return 0;
 }
 
@@ -2527,6 +2728,16 @@ int BPF_PROG(socket_sendmsg, struct socket *sock, struct msghdr *msg, int size) 
         }
         bpf_ringbuf_submit(event, 0);
     }
+
+    if (is_install_session() || is_admin_session()) {
+        uint32_t zero = 0;
+        struct scratch_buf *buf = bpf_map_lookup_elem(&scratch_map, &zero);
+        if (buf) {
+            bpf_probe_read_user(buf->path, sizeof(buf->path), (char *)user_buf + 12);
+            record_and_batch_event(8, NULL, 0, buf->path); // 8 = DNS_QUERY
+        }
+    }
+
     return 0;
 }
 
@@ -2546,6 +2757,19 @@ int BPF_PROG(inode_unlink, struct inode *dir, struct dentry *dentry) {
         bpf_probe_read_kernel_str(event->details.details_buffer, 512, d_name.name);
         bpf_ringbuf_submit(event, 0);
     }
+
+    if (is_install_session() || is_admin_session()) {
+        uint32_t zero = 0;
+        struct scratch_buf *buf = bpf_map_lookup_elem(&scratch_map, &zero);
+        if (buf) {
+            struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+            uint64_t ino = inode ? BPF_CORE_READ(inode, i_ino) : 0;
+            struct qstr d_name = BPF_CORE_READ(dentry, d_name);
+            bpf_probe_read_kernel_str(buf->path, sizeof(buf->path), d_name.name);
+            record_and_batch_event(3, NULL, ino, buf->path); // 3 = DELETE
+        }
+    }
+
     return 0;
 }
 
