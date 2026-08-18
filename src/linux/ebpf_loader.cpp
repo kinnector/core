@@ -15,6 +15,27 @@ struct process_key {
     uint64_t start_time;
 };
 
+// Mirrors kinnector.bpf.c's fw_key4/fw_key6/fw_value exactly (packed,
+// field-for-field) — see that file's Firewall section for the rationale.
+struct fw_key4 {
+    uint32_t prefixlen;
+    uint8_t  addr[4];
+} __attribute__((packed));
+
+struct fw_key6 {
+    uint32_t prefixlen;
+    uint8_t  addr[16];
+} __attribute__((packed));
+
+struct fw_value {
+    uint32_t rule_id;
+    uint16_t port;
+    uint8_t  proto;
+    uint8_t  direction;
+    uint8_t  action;
+    uint8_t  _pad[3];
+} __attribute__((packed));
+
 namespace kinnector::lnx {
 
 static struct bpf_link* AttachOrUpdatePinnedLink(struct bpf_object* bpf_obj, const char* prog_name, const char* pin_path) {
@@ -269,7 +290,9 @@ static void ApplyRamBasedMapScaling(struct bpf_object* bpf_obj) {
         "tainted_process_map",
         "pid_tree_type_map",
         "db_outbound_allowlist",
-        "infra_outbound_allowlist"
+        "infra_outbound_allowlist",
+        "fw_rules_v4",
+        "fw_rules_v6"
     };
 
     for (const char* map_name : maps_to_scale) {
@@ -278,6 +301,34 @@ static void ApplyRamBasedMapScaling(struct bpf_object* bpf_obj) {
             bpf_map__set_max_entries(map, auto_max_entries);
         }
     }
+}
+
+// Pins a map at `pin_path` so its content is inspectable by path (bpftool,
+// or a future stat/open-based check) independent of this process holding an
+// fd — the anti-tamper precedent this codebase already has for *links*
+// (AttachOrUpdatePinnedLink above) never extended to *maps*, so a root user
+// could previously empty fw_rules_v4/v6 via bpftool without tripping
+// anything (ebpf_health.rs only checks link presence). This doesn't by
+// itself detect tampering — see ebpf_health.rs's periodic
+// CountFirewallEntries() comparison for that — but it's the prerequisite:
+// an unpinned map has no stable path for that check to inspect.
+//
+// Any stale pin from a previous process is unlinked and replaced rather
+// than reused — firewall reconcile (warden/src/firewall/reconcile.rs)
+// unconditionally rebuilds desired state from the rule store on every
+// wardend startup, so discarding a prior map's contents on restart is
+// correct, not a loss.
+static bool PinMapReplacing(struct bpf_map* map, const char* pin_path) {
+    if (!map) return false;
+    if (access(pin_path, F_OK) == 0) {
+        unlink(pin_path);
+    }
+    int ret = bpf_map__pin(map, pin_path);
+    if (ret != 0) {
+        std::cerr << "[BPF Map] Failed to pin " << pin_path << ": " << std::strerror(-ret) << std::endl;
+        return false;
+    }
+    return true;
 }
 
 bool EbpfLoader::LoadAndAttachLsm() {
@@ -308,6 +359,12 @@ bool EbpfLoader::LoadAndAttachLsm() {
     // Attach LSM hooks with pinning for zero-downtime hot-reloading
     mkdir("/sys/fs/bpf", 0755);
     mkdir("/sys/fs/bpf/warden", 0755);
+
+    // Pin the firewall maps so their content is path-inspectable — see
+    // PinMapReplacing's comment for why this is a real anti-tamper gap fix,
+    // not routine bookkeeping.
+    PinMapReplacing(bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v4"), "/sys/fs/bpf/warden/fw_rules_v4");
+    PinMapReplacing(bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v6"), "/sys/fs/bpf/warden/fw_rules_v6");
 
     file_open_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "file_open", "/sys/fs/bpf/warden/file_open");
     socket_connect_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "socket_connect", "/sys/fs/bpf/warden/socket_connect");
@@ -590,6 +647,96 @@ bool EbpfLoader::RemoveBypassedDirectoryInode(uint64_t inode) {
     if (!map) return false;
 
     return bpf_map_delete_elem(bpf_map__fd(map), &inode) == 0;
+}
+
+bool EbpfLoader::AddFirewallCidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen,
+                                  uint32_t rule_id, uint16_t port, uint8_t proto,
+                                  uint8_t direction, uint8_t action) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+    if (!addr) return false;
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct fw_value value = {};
+    value.rule_id = rule_id;
+    value.port = port;
+    value.proto = proto;
+    value.direction = direction;
+    value.action = action;
+
+    if (is_v6) {
+        struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v6");
+        if (!map) return false;
+        struct fw_key6 key = {};
+        key.prefixlen = prefixlen;
+        std::memcpy(key.addr, addr, 16);
+        return bpf_map_update_elem(bpf_map__fd(map), &key, &value, BPF_ANY) == 0;
+    } else {
+        struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v4");
+        if (!map) return false;
+        struct fw_key4 key = {};
+        key.prefixlen = prefixlen;
+        std::memcpy(key.addr, addr, 4);
+        return bpf_map_update_elem(bpf_map__fd(map), &key, &value, BPF_ANY) == 0;
+    }
+}
+
+bool EbpfLoader::RemoveFirewallCidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+    if (!addr) return false;
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (is_v6) {
+        struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v6");
+        if (!map) return false;
+        struct fw_key6 key = {};
+        key.prefixlen = prefixlen;
+        std::memcpy(key.addr, addr, 16);
+        return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
+    } else {
+        struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v4");
+        if (!map) return false;
+        struct fw_key4 key = {};
+        key.prefixlen = prefixlen;
+        std::memcpy(key.addr, addr, 4);
+        return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
+    }
+}
+
+int64_t EbpfLoader::CountFirewallEntries() {
+    if (mock_mode_ || !bpf_obj_) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    int64_t total = 0;
+
+    struct bpf_map* map_v4 = bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v4");
+    if (!map_v4) return -1;
+    int fd_v4 = bpf_map__fd(map_v4);
+    struct fw_key4 key4 = {}, next_key4 = {};
+    bool has_key4 = false;
+    while (bpf_map_get_next_key(fd_v4, has_key4 ? &key4 : nullptr, &next_key4) == 0) {
+        total++;
+        key4 = next_key4;
+        has_key4 = true;
+    }
+
+    struct bpf_map* map_v6 = bpf_object__find_map_by_name(bpf_obj_, "fw_rules_v6");
+    if (!map_v6) return -1;
+    int fd_v6 = bpf_map__fd(map_v6);
+    struct fw_key6 key6 = {}, next_key6 = {};
+    bool has_key6 = false;
+    while (bpf_map_get_next_key(fd_v6, has_key6 ? &key6 : nullptr, &next_key6) == 0) {
+        total++;
+        key6 = next_key6;
+        has_key6 = true;
+    }
+
+    return total;
 }
 
 

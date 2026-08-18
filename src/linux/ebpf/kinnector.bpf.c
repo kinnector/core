@@ -394,6 +394,60 @@ struct {
     __type(value, uint64_t);
 } dns_cache_map SEC(".maps");
 
+// ---------------------------------------------------------------------------
+// Firewall — egress-only in-kernel CIDR table (Firewall design plan, 2026-08).
+//
+// Two LPM_TRIE maps (v4/v6 need separate fixed-width keys — LPM_TRIE keys
+// can't be variable-length). Userspace (warden's EbpfBackend,
+// warden/src/firewall/backend.rs) owns the desired-state diff and issues
+// one bpf_map_update_elem/delete_elem per CIDR; rule_id in fw_value is for
+// audit/introspection only (bulk revoke-by-rule happens in userspace, which
+// tracks which CIDRs belong to which rule — LPM_TRIE has no secondary index
+// for that). Checked only from lsm/socket_connect (egress) — socket_listen
+// and socket_post_accept do not enforce (see those hooks' comments below);
+// real inbound eBPF enforcement would need an XDP/TC program this codebase
+// doesn't have yet, so inbound blocking stays iptables/nftables-only.
+#define FW_ACTION_ALLOW 0
+#define FW_ACTION_DENY  1
+
+struct fw_key4 {
+    uint32_t prefixlen; // must be first field, in bits (0-32) — LPM_TRIE requirement
+    uint8_t  addr[4];   // network-byte-order IPv4
+} __attribute__((packed));
+
+struct fw_key6 {
+    uint32_t prefixlen; // bits, 0-128
+    uint8_t  addr[16];
+} __attribute__((packed));
+
+struct fw_value {
+    uint32_t rule_id;   // opaque id from warden's firewall_rules.json — audit only
+    uint16_t port;      // 0 = any. LPM_TRIE can't match on port (not part of the
+                         // key's prefix bytes), so this is informational only —
+                         // a port-scoped rule is enforced precisely by iptables
+                         // instead (see reconcile::select_backend_for_rule) and
+                         // applied here as CIDR-wide to avoid under-blocking.
+    uint8_t  proto;     // 0=any, 6=TCP, 17=UDP — not matched here, audit only
+    uint8_t  direction; // reserved for future ingress support; always egress today
+    uint8_t  action;    // FW_ACTION_ALLOW | FW_ACTION_DENY
+    uint8_t  _pad[3];
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(map_flags, BPF_F_NO_PREALLOC); // required by the kernel for LPM_TRIE
+    __uint(max_entries, 131072);
+    __type(key, struct fw_key4);
+    __type(value, struct fw_value);
+} fw_rules_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __uint(max_entries, 32768);
+    __type(key, struct fw_key6);
+    __type(value, struct fw_value);
+} fw_rules_v6 SEC(".maps");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -527,6 +581,35 @@ static __always_inline int is_install_session() {
     uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
     if (tree_type && (*tree_type & TREE_INSTALL_CONTEXT)) {
         return 1;
+    }
+    return 0;
+}
+
+// Firewall egress check — LPM longest-prefix lookup against fw_rules_v4/v6.
+// dest_ip is 4 raw network-byte-order bytes (as already extracted by
+// socket_connect's existing sin->sin_addr.s_addr read); dest_ip6 is 16 raw
+// network-byte-order bytes. Only DENY is checked: there is no explicit
+// ALLOW override at this layer (unlike IptablesBackend's -I precedent) —
+// an eBPF-layer allowlist entry isn't written by warden today, so
+// FW_ACTION_ALLOW values are reserved for future use and currently
+// unreachable via the rule store.
+static __always_inline int fw_check_egress(unsigned short family, uint32_t dest_ip, const uint8_t *dest_ip6) {
+    if (family == 2) {
+        struct fw_key4 key = {};
+        key.prefixlen = 32;
+        __builtin_memcpy(key.addr, &dest_ip, 4);
+        struct fw_value *v = bpf_map_lookup_elem(&fw_rules_v4, &key);
+        if (v && v->action == FW_ACTION_DENY) {
+            return -EACCES;
+        }
+    } else if (family == 10 && dest_ip6) {
+        struct fw_key6 key = {};
+        key.prefixlen = 128;
+        __builtin_memcpy(key.addr, dest_ip6, 16);
+        struct fw_value *v = bpf_map_lookup_elem(&fw_rules_v6, &key);
+        if (v && v->action == FW_ACTION_DENY) {
+            return -EACCES;
+        }
     }
     return 0;
 }
@@ -1132,6 +1215,7 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
     if (blocking_enabled) {
         uint16_t dest_port = 0;
         uint32_t dest_ip = 0;
+        uint8_t dest_ip6[16] = {};
         if (family == 2) {
             struct sockaddr_in *sin = (struct sockaddr_in *)address;
             uint16_t port_be = 0;
@@ -1143,6 +1227,7 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
             uint16_t port_be = 0;
             bpf_probe_read_kernel(&port_be, sizeof(port_be), &sin6->sin6_port);
             dest_port = ((port_be & 0xFF) << 8) | ((port_be >> 8) & 0xFF);
+            bpf_probe_read_kernel(dest_ip6, sizeof(dest_ip6), &sin6->sin6_addr.in6_u.u6_addr8);
         }
 
         // Rule 1: API Port Protection - Block external/public connections to Docker/Kubelet APIs
@@ -1150,6 +1235,17 @@ int BPF_PROG(socket_connect, struct socket *sock, struct sockaddr *address, int 
             if (family == 2 && !is_private_ip(dest_ip)) {
                 return -EACCES;
             }
+        }
+
+        // Firewall rule store (warden/src/firewall) — explicit IP/CIDR DENY
+        // rules and, budget-capped, resolved GeoIP country rules. Placed
+        // before role-based sandboxing below so an explicit firewall DENY
+        // is authoritative over a role ALLOW, matching every other check
+        // in this function sitting downstream of the trust/admin bypasses
+        // above but upstream of role logic.
+        int fw_result = fw_check_egress(family, dest_ip, dest_ip6);
+        if (fw_result != 0) {
+            return fw_result;
         }
     }
 
@@ -2049,6 +2145,15 @@ int BPF_PROG(mmap_file, struct file *file, unsigned long reqprot,
     return 0;
 }
 
+// Deliberate no-op: this hook only fires when a local socket starts
+// listening (bind/listen), not per-remote-peer, so it can't express "deny
+// inbound connections from CIDR X" the way fw_check_egress does for
+// outbound. Real inbound eBPF enforcement needs a hook that sees each
+// remote peer (XDP or an ingress LSM socket hook this program doesn't
+// attach today) — a separate, larger project. Inbound firewall rules are
+// enforced by IptablesBackend/NftablesBackend's INPUT chain instead (see
+// warden/src/firewall/backend.rs) — that's a complete, working enforcement
+// path already, just not this one.
 SEC("lsm/socket_listen")
 int BPF_PROG(socket_listen, struct socket *sock, int backlog) {
     return 0;

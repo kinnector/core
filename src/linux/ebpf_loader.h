@@ -66,6 +66,21 @@ public:
     // DB: remove a directory inode from bypassed_directories (on DB process stop)
     bool RemoveBypassedDirectoryInode(uint64_t inode);
 
+    // Firewall (warden/src/firewall) — one CIDR at a time; the caller
+    // (warden's EbpfBackend) owns the desired-state diff and issues a call
+    // per added/removed CIDR, so no bulk/array variant is needed here — see
+    // fw_key4/fw_key6/fw_value in kinnector.bpf.c for the wire shape.
+    // `addr` must point to 4 bytes (is_v6=false) or 16 bytes (is_v6=true),
+    // network byte order. `prefixlen` is in bits.
+    bool AddFirewallCidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen,
+                          uint32_t rule_id, uint16_t port, uint8_t proto,
+                          uint8_t direction, uint8_t action);
+    bool RemoveFirewallCidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen);
+    // Anti-tamper: total live entry count across both firewall tries, for
+    // ebpf_health.rs to compare against warden's own expected count.
+    // Returns -1 if the maps aren't reachable (mock mode / not loaded).
+    int64_t CountFirewallEntries();
+
     // Checks if the active mode is BPF LSM or Fallback (Tracepoints)
     bool IsLsmActive() const { return lsm_active_; }
     bool IsMockMode() const { return mock_mode_; }

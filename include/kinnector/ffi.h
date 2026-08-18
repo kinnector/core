@@ -59,6 +59,14 @@ KINNECTOR_API bool send_telemetry_event(const TelemetryEvent* event);
 // Check if LSM mode is actively loaded in the kernel
 KINNECTOR_API bool is_lsm_active();
 
+// Firewall (warden/src/firewall) — see ebpf_loader.h's AddFirewallCidr doc
+// comment for the addr/prefixlen contract.
+KINNECTOR_API bool add_firewall_cidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen,
+                                      uint32_t rule_id, uint16_t port, uint8_t proto,
+                                      uint8_t direction, uint8_t action);
+KINNECTOR_API bool remove_firewall_cidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen);
+KINNECTOR_API int64_t count_firewall_entries();
+
 #ifdef __cplusplus
 }
 #endif

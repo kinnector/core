@@ -380,6 +380,43 @@ bool is_lsm_active() {
     return false;
 }
 
+// Firewall (warden/src/firewall) — see ebpf_loader.h's AddFirewallCidr for
+// the addr/prefixlen contract. `is_v6` selects fw_rules_v4 vs fw_rules_v6.
+bool add_firewall_cidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen,
+                        uint32_t rule_id, uint16_t port, uint8_t proto,
+                        uint8_t direction, uint8_t action) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->AddFirewallCidr(is_v6, addr, prefixlen, rule_id, port, proto, direction, action);
+    }
+#endif
+    return false;
+}
+
+bool remove_firewall_cidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->RemoveFirewallCidr(is_v6, addr, prefixlen);
+    }
+#endif
+    return false;
+}
+
+// Anti-tamper: -1 if unavailable (mock mode / not loaded), so the caller
+// (warden/src/ebpf_health.rs) can distinguish "can't check" from "zero
+// entries is correct."
+int64_t count_firewall_entries() {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->CountFirewallEntries();
+    }
+#endif
+    return -1;
+}
+
 bool send_telemetry_event(const TelemetryEvent* event) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
     if (g_sender && g_running && event) {
