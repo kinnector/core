@@ -15,6 +15,14 @@ struct process_key {
     uint64_t start_time;
 };
 
+// Phase 6 (LINUX_COVERAGE_PLAN.md): mirrors kinnector.bpf.c's struct resource_id
+// exactly -- the canonical (dev, ino) key for the sensitive/protected-*file*-
+// identity maps. See that file's declaration comment for the scoping rationale.
+struct resource_id {
+    uint64_t dev;
+    uint64_t ino;
+};
+
 // Mirrors kinnector.bpf.c's fw_key4/fw_key6/fw_value exactly (packed,
 // field-for-field) — see that file's Firewall section for the rationale.
 struct fw_key4 {
@@ -37,6 +45,13 @@ struct fw_value {
 } __attribute__((packed));
 
 namespace kinnector::lnx {
+
+// Phase 3 (LINUX_COVERAGE_PLAN.md): must match kinnector.bpf.c's
+// resource_owner_hash() exactly, bit-for-bit — this is the userspace side of
+// resource_owner_map's 64-slot bitmask representation.
+static uint32_t ResourceOwnerHash(uint64_t exec_ino) {
+    return static_cast<uint32_t>((exec_ino * 2654435761ULL) & 0x3FULL);
+}
 
 static struct bpf_link* AttachOrUpdatePinnedLink(struct bpf_object* bpf_obj, const char* prog_name, const char* pin_path) {
     struct bpf_program* prog = bpf_object__find_program_by_name(bpf_obj, prog_name);
@@ -211,6 +226,8 @@ void EbpfLoader::Stop() {
     CleanPinnedLink(mprotect_link_);
     CleanPinnedLink(task_kill_link_);
     CleanPinnedLink(path_chmod_link_);
+    CleanPinnedLink(mmap_file_link_);
+    CleanPinnedLink(fork_link_);
 
     // Fallback tracepoints are not pinned, so we can destroy them normally
     if (tp_exec_link_)         { bpf_link__destroy(tp_exec_link_); tp_exec_link_ = nullptr; }
@@ -222,6 +239,7 @@ void EbpfLoader::Stop() {
     if (tp_dup2_link_)         { bpf_link__destroy(tp_dup2_link_); tp_dup2_link_ = nullptr; }
     if (tp_dup3_link_)         { bpf_link__destroy(tp_dup3_link_); tp_dup3_link_ = nullptr; }
     if (tp_listen_link_)       { bpf_link__destroy(tp_listen_link_); tp_listen_link_ = nullptr; }
+    if (tp_fork_link_)         { bpf_link__destroy(tp_fork_link_); tp_fork_link_ = nullptr; }
 
 
     file_open_link_      = nullptr;
@@ -236,6 +254,8 @@ void EbpfLoader::Stop() {
     mprotect_link_       = nullptr;
     task_kill_link_      = nullptr;
     path_chmod_link_     = nullptr;
+    mmap_file_link_      = nullptr;
+    fork_link_           = nullptr;
     tp_exec_link_        = nullptr;
     tp_connect_link_     = nullptr;
     tp_exit_link_        = nullptr;
@@ -245,6 +265,7 @@ void EbpfLoader::Stop() {
     tp_dup2_link_        = nullptr;
     tp_dup3_link_        = nullptr;
     tp_listen_link_      = nullptr;
+    tp_fork_link_        = nullptr;
 
     if (bpf_obj_) {
         bpf_object__close(bpf_obj_);
@@ -376,6 +397,16 @@ bool EbpfLoader::LoadAndAttachLsm() {
     task_kill_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "task_kill", "/sys/fs/bpf/warden/task_kill");
     path_chmod_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "path_chmod", "/sys/fs/bpf/warden/path_chmod");
 
+    // Phase 1 (LINUX_COVERAGE_PLAN.md): activate the two LSM-relevant
+    // programs that were compiled but never attached. mmap_file is LSM-only
+    // (no fallback equivalent — image-load telemetry + W^X enforcement need
+    // the LSM hook's synchronous context). tracepoint_sched_process_fork is
+    // attached here too (in addition to LoadAndAttachFallback below) because
+    // §4's lineage-marker propagation must run regardless of which mode
+    // Start() picked for the LSM-gated deny hooks.
+    mmap_file_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "mmap_file", "/sys/fs/bpf/warden/mmap_file");
+    fork_link_ = AttachOrUpdatePinnedLink(bpf_obj_, "tracepoint_sched_process_fork", "/sys/fs/bpf/warden/tracepoint_sched_process_fork");
+
     // P2-8: Attach file_permission for FileWrite events
     AttachOrUpdatePinnedLink(bpf_obj_, "file_permission", "/sys/fs/bpf/warden/file_permission");
 
@@ -442,6 +473,11 @@ bool EbpfLoader::LoadAndAttachFallback() {
     prog = bpf_object__find_program_by_name(bpf_obj_, "tracepoint_sys_enter_listen");
     if (prog) tp_listen_link_ = bpf_program__attach(prog);
 
+    // Phase 1 (LINUX_COVERAGE_PLAN.md): fork-time lineage propagation must
+    // run in fallback mode too, not just when the LSM hooks are active.
+    prog = bpf_object__find_program_by_name(bpf_obj_, "tracepoint_sched_process_fork");
+    if (prog) tp_fork_link_ = bpf_program__attach(prog);
+
     return tp_exec_link_ != nullptr;
 
 }
@@ -466,6 +502,9 @@ bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         case BpfMapType::ExecAllowlistMap: map_name = "exec_allowlist_map"; break;
         case BpfMapType::AdminSessionPids: map_name = "admin_session_pids"; break;
         case BpfMapType::TrustedAdminBinaries: map_name = "trusted_admin_binaries"; break;
+        case BpfMapType::InstallBinaryMap: map_name = "install_binary_map"; break;
+        case BpfMapType::ProtectedOwnerBinaries: map_name = "protected_owner_binaries"; break;
+        case BpfMapType::ProtectedOwnerPids: map_name = "protected_owner_pids"; break;
         default: return false;
     }
 
@@ -475,10 +514,7 @@ bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
     int fd = bpf_map__fd(map);
     
     // For maps that key on pid (uint32_t) rather than process_key
-    if (map_type == BpfMapType::PidTreeType) {
-        uint32_t val = value;
-        return bpf_map_update_elem(fd, &pid, &val, BPF_ANY) == 0;
-    } else if (map_type == BpfMapType::JvmExceptionPids || map_type == BpfMapType::AdminSessionPids) {
+    if (map_type == BpfMapType::JvmExceptionPids || map_type == BpfMapType::AdminSessionPids) {
         uint8_t val8 = static_cast<uint8_t>(value);
         return bpf_map_update_elem(fd, &pid, &val8, BPF_ANY) == 0;
     } else if (map_type == BpfMapType::DbOutboundAllowlist || map_type == BpfMapType::InfraOutboundAllowlist) {
@@ -488,16 +524,17 @@ bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         } __attribute__((packed)) key = { pid, static_cast<uint32_t>(start_time) };
         uint8_t val8 = static_cast<uint8_t>(value);
         return bpf_map_update_elem(fd, &key, &val8, BPF_ANY) == 0;
-    } else if (map_type == BpfMapType::ExecAllowlistMap || map_type == BpfMapType::TrustedAdminBinaries) {
+    } else if (map_type == BpfMapType::ExecAllowlistMap || map_type == BpfMapType::TrustedAdminBinaries ||
+               map_type == BpfMapType::InstallBinaryMap || map_type == BpfMapType::ProtectedOwnerBinaries) {
         uint64_t key = start_time;
         uint8_t val8 = static_cast<uint8_t>(value);
         return bpf_map_update_elem(fd, &key, &val8, BPF_ANY) == 0;
     }
 
     struct process_key key = { pid, start_time };
-    
-    // For TrustedRoots, map holds uint8_t, others hold uint32_t
-    if (map_type == BpfMapType::TrustedRoots) {
+
+    // For TrustedRoots/ProtectedOwnerPids, map holds uint8_t, others hold uint32_t
+    if (map_type == BpfMapType::TrustedRoots || map_type == BpfMapType::ProtectedOwnerPids) {
         uint8_t val8 = static_cast<uint8_t>(value);
         return bpf_map_update_elem(fd, &key, &val8, BPF_ANY) == 0;
     } else {
@@ -525,6 +562,9 @@ bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         case BpfMapType::ExecAllowlistMap: map_name = "exec_allowlist_map"; break;
         case BpfMapType::AdminSessionPids: map_name = "admin_session_pids"; break;
         case BpfMapType::TrustedAdminBinaries: map_name = "trusted_admin_binaries"; break;
+        case BpfMapType::InstallBinaryMap: map_name = "install_binary_map"; break;
+        case BpfMapType::ProtectedOwnerBinaries: map_name = "protected_owner_binaries"; break;
+        case BpfMapType::ProtectedOwnerPids: map_name = "protected_owner_pids"; break;
         default: return false;
     }
 
@@ -532,7 +572,7 @@ bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
     if (!map) return false;
 
     int fd = bpf_map__fd(map);
-    if (map_type == BpfMapType::PidTreeType || map_type == BpfMapType::JvmExceptionPids || map_type == BpfMapType::AdminSessionPids) {
+    if (map_type == BpfMapType::JvmExceptionPids || map_type == BpfMapType::AdminSessionPids) {
         return bpf_map_delete_elem(fd, &pid) == 0;
     } else if (map_type == BpfMapType::DbOutboundAllowlist || map_type == BpfMapType::InfraOutboundAllowlist) {
         struct {
@@ -540,7 +580,8 @@ bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
             uint32_t ip;
         } __attribute__((packed)) key = { pid, static_cast<uint32_t>(start_time) };
         return bpf_map_delete_elem(fd, &key) == 0;
-    } else if (map_type == BpfMapType::ExecAllowlistMap || map_type == BpfMapType::TrustedAdminBinaries) {
+    } else if (map_type == BpfMapType::ExecAllowlistMap || map_type == BpfMapType::TrustedAdminBinaries ||
+               map_type == BpfMapType::InstallBinaryMap || map_type == BpfMapType::ProtectedOwnerBinaries) {
         uint64_t key = start_time;
         return bpf_map_delete_elem(fd, &key) == 0;
     } else {
@@ -549,7 +590,7 @@ bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
     }
 }
 
-bool EbpfLoader::AddSensitiveInode(uint64_t inode, uint32_t category) {
+bool EbpfLoader::AddSensitiveInode(uint64_t dev, uint64_t inode, uint32_t category) {
     if (mock_mode_ || !bpf_obj_) {
         return true;
     }
@@ -558,10 +599,11 @@ bool EbpfLoader::AddSensitiveInode(uint64_t inode, uint32_t category) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "sensitive_inodes_map");
     if (!map) return false;
 
-    return bpf_map_update_elem(bpf_map__fd(map), &inode, &category, BPF_ANY) == 0;
+    struct resource_id key = { dev, inode };
+    return bpf_map_update_elem(bpf_map__fd(map), &key, &category, BPF_ANY) == 0;
 }
 
-bool EbpfLoader::AddProtectedStaticInode(uint64_t inode) {
+bool EbpfLoader::AddProtectedStaticInode(uint64_t dev, uint64_t inode) {
     if (mock_mode_ || !bpf_obj_) {
         return true;
     }
@@ -570,11 +612,12 @@ bool EbpfLoader::AddProtectedStaticInode(uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "protected_static_inodes");
     if (!map) return false;
 
+    struct resource_id key = { dev, inode };
     uint8_t val = 1;
-    return bpf_map_update_elem(bpf_map__fd(map), &inode, &val, BPF_ANY) == 0;
+    return bpf_map_update_elem(bpf_map__fd(map), &key, &val, BPF_ANY) == 0;
 }
 
-bool EbpfLoader::RemoveProtectedStaticInode(uint64_t inode) {
+bool EbpfLoader::RemoveProtectedStaticInode(uint64_t dev, uint64_t inode) {
     if (mock_mode_ || !bpf_obj_) {
         return true;
     }
@@ -583,7 +626,8 @@ bool EbpfLoader::RemoveProtectedStaticInode(uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "protected_static_inodes");
     if (!map) return false;
 
-    return bpf_map_delete_elem(bpf_map__fd(map), &inode) == 0;
+    struct resource_id key = { dev, inode };
+    return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
 }
 
 bool EbpfLoader::AddTrustedExecInode(uint64_t inode, uint32_t trust_level) {
@@ -624,7 +668,7 @@ bool EbpfLoader::SetConfigValue(uint32_t index, uint32_t value) {
     return bpf_map_update_elem(bpf_map__fd(map), &index, &value, BPF_ANY) == 0;
 }
 
-bool EbpfLoader::AddBypassedDirectoryInode(uint64_t inode) {
+bool EbpfLoader::AddBypassedDirectoryInode(uint64_t dev, uint64_t inode) {
     if (mock_mode_ || !bpf_obj_) {
         return true;
     }
@@ -633,11 +677,12 @@ bool EbpfLoader::AddBypassedDirectoryInode(uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "bypassed_directories");
     if (!map) return false;
 
+    struct resource_id key = { dev, inode };
     uint8_t val = 1;
-    return bpf_map_update_elem(bpf_map__fd(map), &inode, &val, BPF_ANY) == 0;
+    return bpf_map_update_elem(bpf_map__fd(map), &key, &val, BPF_ANY) == 0;
 }
 
-bool EbpfLoader::RemoveBypassedDirectoryInode(uint64_t inode) {
+bool EbpfLoader::RemoveBypassedDirectoryInode(uint64_t dev, uint64_t inode) {
     if (mock_mode_ || !bpf_obj_) {
         return true;
     }
@@ -646,7 +691,46 @@ bool EbpfLoader::RemoveBypassedDirectoryInode(uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "bypassed_directories");
     if (!map) return false;
 
-    return bpf_map_delete_elem(bpf_map__fd(map), &inode) == 0;
+    struct resource_id key = { dev, inode };
+    return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
+}
+
+bool EbpfLoader::AddResourceOwner(uint64_t resource_dev, uint64_t resource_inode, uint64_t owner_exec_inode) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "resource_owner_map");
+    if (!map) return false;
+
+    int fd = bpf_map__fd(map);
+    struct resource_id key = { resource_dev, resource_inode };
+    uint64_t bit = 1ULL << ResourceOwnerHash(owner_exec_inode);
+    uint64_t existing_mask = 0;
+    bpf_map_lookup_elem(fd, &key, &existing_mask); // 0 on miss — fine, OR still correct
+    uint64_t new_mask = existing_mask | bit;
+    return bpf_map_update_elem(fd, &key, &new_mask, BPF_ANY) == 0;
+}
+
+bool EbpfLoader::RemoveResourceOwner(uint64_t resource_dev, uint64_t resource_inode, uint64_t owner_exec_inode) {
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "resource_owner_map");
+    if (!map) return false;
+
+    int fd = bpf_map__fd(map);
+    struct resource_id key = { resource_dev, resource_inode };
+    uint64_t existing_mask = 0;
+    if (bpf_map_lookup_elem(fd, &key, &existing_mask) != 0) {
+        return true; // Nothing to remove.
+    }
+    uint64_t bit = 1ULL << ResourceOwnerHash(owner_exec_inode);
+    uint64_t new_mask = existing_mask & ~bit;
+    return bpf_map_update_elem(fd, &key, &new_mask, BPF_ANY) == 0;
 }
 
 bool EbpfLoader::AddFirewallCidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen,

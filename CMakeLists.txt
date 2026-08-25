@@ -152,6 +152,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(kinnector-test-warden-all src/linux/test_warden_all.cpp)
     target_link_libraries(kinnector-test-warden-all PRIVATE kinnector-core)
     add_test(NAME test_warden_all COMMAND kinnector-test-warden-all)
+
+    # LINUX_COVERAGE_PLAN.md "Testing strategy" item 1: real syscall-level
+    # deny assertions. The probe is deliberately not linked against
+    # kinnector-core -- see enforcement_probe.cpp's header comment.
+    add_executable(kinnector-enforcement-probe src/linux/test_helpers/enforcement_probe.cpp)
+
+    add_executable(kinnector-test-enforcement-e2e src/linux/test_enforcement_e2e.cpp)
+    target_link_libraries(kinnector-test-enforcement-e2e PRIVATE kinnector-core)
+    add_dependencies(kinnector-test-enforcement-e2e kinnector-enforcement-probe)
+    add_test(NAME test_enforcement_e2e COMMAND kinnector-test-enforcement-e2e)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")

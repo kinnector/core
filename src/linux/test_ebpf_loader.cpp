@@ -52,7 +52,10 @@ void TestMockMode() {
         kinnector::lnx::BpfMapType::InfraOutboundAllowlist,
         kinnector::lnx::BpfMapType::ExecAllowlistMap,
         kinnector::lnx::BpfMapType::AdminSessionPids,
-        kinnector::lnx::BpfMapType::TrustedAdminBinaries
+        kinnector::lnx::BpfMapType::TrustedAdminBinaries,
+        kinnector::lnx::BpfMapType::InstallBinaryMap,
+        kinnector::lnx::BpfMapType::ProtectedOwnerBinaries,
+        kinnector::lnx::BpfMapType::ProtectedOwnerPids
     };
 
     for (auto map_type : all_maps) {
@@ -64,14 +67,14 @@ void TestMockMode() {
     assert(loader.UpdateMapEntry(static_cast<kinnector::lnx::BpfMapType>(999), 1234, 56789ULL, 1) == false);
 
     // Test specific helpers in Mock Mode
-    assert(loader.AddSensitiveInode(10001, 2) == true);
-    assert(loader.AddProtectedStaticInode(10002) == true);
-    assert(loader.RemoveProtectedStaticInode(10002) == true);
+    assert(loader.AddSensitiveInode(1, 10001, 2) == true);
+    assert(loader.AddProtectedStaticInode(1, 10002) == true);
+    assert(loader.RemoveProtectedStaticInode(1, 10002) == true);
     assert(loader.AddTrustedExecInode(10003, 5) == true);
     assert(loader.LookupTrustedExecInode(10003) == false); // In mock mode lookup returns false or check
     assert(loader.SetConfigValue(0, 100) == true);
-    assert(loader.AddBypassedDirectoryInode(10004) == true);
-    assert(loader.RemoveBypassedDirectoryInode(10004) == true);
+    assert(loader.AddBypassedDirectoryInode(1, 10004) == true);
+    assert(loader.RemoveBypassedDirectoryInode(1, 10004) == true);
 
     loader.Stop();
     // Double Stop should be safe
@@ -105,14 +108,14 @@ void TestRealKernelMode() {
     assert(loader.DeleteMapEntry(kinnector::lnx::BpfMapType::CategoryFlags, 4321, 9999ULL) == true);
 
     // Verify helpers against real kernel maps
-    assert(loader.AddSensitiveInode(20001, 1) == true);
-    assert(loader.AddProtectedStaticInode(20002) == true);
-    assert(loader.RemoveProtectedStaticInode(20002) == true);
+    assert(loader.AddSensitiveInode(1, 20001, 1) == true);
+    assert(loader.AddProtectedStaticInode(1, 20002) == true);
+    assert(loader.RemoveProtectedStaticInode(1, 20002) == true);
     assert(loader.AddTrustedExecInode(20003, 3) == true);
     assert(loader.LookupTrustedExecInode(20003) == true);
     assert(loader.SetConfigValue(0, 500) == true);
-    assert(loader.AddBypassedDirectoryInode(20004) == true);
-    assert(loader.RemoveBypassedDirectoryInode(20004) == true);
+    assert(loader.AddBypassedDirectoryInode(1, 20004) == true);
+    assert(loader.RemoveBypassedDirectoryInode(1, 20004) == true);
 
     loader.Stop();
     std::cout << "  - Real kernel mode verified successfully." << std::endl;

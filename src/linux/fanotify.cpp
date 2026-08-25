@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "fanotify.h"
 #include <sys/fanotify.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <limits.h>
@@ -23,24 +24,43 @@ bool FanotifyMonitor::Initialize(const std::string& mount_path) {
 
     mount_path_ = mount_path;
 
-    // Initialize fanotify notification group
-    fanotify_fd_ = fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, O_RDONLY | O_LARGEFILE);
+    // Phase 8 (LINUX_COVERAGE_PLAN.md): try a permission-event-capable group
+    // first (FAN_CLASS_CONTENT) so FAN_OPEN_PERM marks below can actually block,
+    // not just notify -- belt-and-suspenders for kernels without BPF LSM
+    // support. FAN_CLASS_CONTENT requires the fd to be read-write. Falls back to
+    // the original notify-only FAN_CLASS_NOTIF group (unprivileged/unsupported
+    // kernels, e.g. inside some containers) so FIM telemetry keeps working even
+    // when permission events can't be set up.
+    fanotify_fd_ = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDWR | O_LARGEFILE);
+    if (fanotify_fd_ >= 0) {
+        permission_capable_ = true;
+    } else {
+        std::cerr << "[Fanotify] FAN_CLASS_CONTENT unavailable (" << std::strerror(errno)
+                  << "), falling back to notify-only mode." << std::endl;
+        fanotify_fd_ = fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, O_RDONLY | O_LARGEFILE);
+        permission_capable_ = false;
+    }
     if (fanotify_fd_ < 0) {
         std::cerr << "[Fanotify] Failed to initialize fanotify: " << std::strerror(errno) << std::endl;
         return false;
     }
 
-    // Mark the mount point to monitor file modification and write completion
+    // Mark the mount point to monitor file modification and write completion,
+    // plus (when permission-capable) FAN_OPEN_PERM for synchronous open blocking.
+    uint64_t mask = FAN_MODIFY | FAN_CLOSE_WRITE | FAN_EVENT_ON_CHILD;
+    if (permission_capable_) {
+        mask |= FAN_OPEN_PERM;
+    }
     int ret = fanotify_mark(
         fanotify_fd_,
         FAN_MARK_ADD | FAN_MARK_MOUNT,
-        FAN_MODIFY | FAN_CLOSE_WRITE | FAN_EVENT_ON_CHILD,
+        mask,
         AT_FDCWD,
         mount_path_.c_str()
     );
 
     if (ret < 0) {
-        std::cerr << "[Fanotify] Failed to add fanotify mark on " << mount_path_ 
+        std::cerr << "[Fanotify] Failed to add fanotify mark on " << mount_path_
                   << ": " << std::strerror(errno) << std::endl;
         close(fanotify_fd_);
         fanotify_fd_ = -1;
@@ -48,8 +68,27 @@ bool FanotifyMonitor::Initialize(const std::string& mount_path) {
     }
 
     initialized_ = true;
-    std::cout << "[Fanotify] File Integrity Monitor initialized on mount: " << mount_path_ << std::endl;
+    std::cout << "[Fanotify] File Integrity Monitor initialized on mount: " << mount_path_
+              << (permission_capable_ ? " (permission-capable, FAN_OPEN_PERM blocking active)" : " (notify-only)")
+              << std::endl;
     return true;
+}
+
+bool FanotifyMonitor::AddProtectedResource(uint64_t dev, uint64_t ino) {
+    std::lock_guard<std::mutex> lock(protected_resources_mutex_);
+    protected_resources_.insert(ResourceId{dev, ino});
+    return true;
+}
+
+bool FanotifyMonitor::RemoveProtectedResource(uint64_t dev, uint64_t ino) {
+    std::lock_guard<std::mutex> lock(protected_resources_mutex_);
+    protected_resources_.erase(ResourceId{dev, ino});
+    return true;
+}
+
+bool FanotifyMonitor::IsProtectedResource(uint64_t dev, uint64_t ino) {
+    std::lock_guard<std::mutex> lock(protected_resources_mutex_);
+    return protected_resources_.count(ResourceId{dev, ino}) > 0;
 }
 
 bool FanotifyMonitor::Start() {
@@ -114,6 +153,32 @@ void FanotifyMonitor::MonitorLoop() {
             }
 
             if (metadata->fd >= 0) {
+                // Phase 8 (LINUX_COVERAGE_PLAN.md): permission event -- must
+                // write an allow/deny response before this fd is closed, or
+                // the waiting process's open() hangs. Handled separately from
+                // the notify-only telemetry path below; deliberately skips
+                // telemetry for this event (the FAN_MODIFY/FAN_CLOSE_WRITE
+                // path already covers write telemetry).
+                if (metadata->mask & FAN_OPEN_PERM) {
+                    struct stat st{};
+                    uint32_t decision = FAN_ALLOW;
+                    if (fstat(metadata->fd, &st) == 0 &&
+                        IsProtectedResource(static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino))) {
+                        decision = FAN_DENY;
+                    }
+                    struct fanotify_response resp{};
+                    resp.fd = metadata->fd;
+                    resp.response = decision;
+                    ssize_t wret = write(fanotify_fd_, &resp, sizeof(resp));
+                    if (wret != sizeof(resp)) {
+                        std::cerr << "[Fanotify] Failed to write permission response: "
+                                  << std::strerror(errno) << std::endl;
+                    }
+                    close(metadata->fd);
+                    metadata = FAN_EVENT_NEXT(metadata, len);
+                    continue;
+                }
+
                 // Resolve path using /proc/self/fd/
                 char path[PATH_MAX];
                 char proc_path[64];

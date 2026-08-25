@@ -7,6 +7,10 @@
 #include <atomic>
 #include <cstring>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <cerrno>
 
 using namespace kinnector;
 using namespace kinnector::lnx;
@@ -70,11 +74,86 @@ void TestFanotifyLifecycle() {
     std::cout << "  - FanotifyMonitor lifecycle and event dispatch verified." << std::endl;
 }
 
+// Phase 8 (LINUX_COVERAGE_PLAN.md): belt-and-suspenders blocking test --
+// confirms FAN_OPEN_PERM actually denies access to a registered resource, not
+// just that notification events arrive. Skips gracefully (like
+// TestFanotifyLifecycle above) when fanotify_init fails or FAN_CLASS_CONTENT
+// isn't available -- both require CAP_SYS_ADMIN, same constraint as every
+// other real-kernel test in this suite.
+void TestFanotifyOpenPermBlocking() {
+    std::cout << "[TestFanotify] Testing FAN_OPEN_PERM blocking..." << std::endl;
+    kinnector::lnx::FanotifyMonitor monitor;
+
+    if (!monitor.Initialize("/home")) {
+        std::cout << "  - Note: fanotify_init failed (likely lack of sudo/root permissions). Skipping." << std::endl;
+        return;
+    }
+    if (!monitor.IsPermissionCapable()) {
+        std::cout << "  - Note: FAN_CLASS_CONTENT unavailable (fell back to notify-only). Skipping blocking test." << std::endl;
+        monitor.Stop();
+        return;
+    }
+
+    std::string protected_path = "/home/user/Documents/kinnector/fanotify_perm_test_protected.txt";
+    std::string open_path = "/home/user/Documents/kinnector/fanotify_perm_test_open.txt";
+    {
+        std::ofstream out1(protected_path, std::ios::trunc);
+        out1 << "protected" << std::endl;
+        std::ofstream out2(open_path, std::ios::trunc);
+        out2 << "open" << std::endl;
+    }
+
+    struct stat st{};
+    if (stat(protected_path.c_str(), &st) != 0) {
+        std::cout << "  - Note: could not stat protected test file, skipping." << std::endl;
+        unlink(protected_path.c_str());
+        unlink(open_path.c_str());
+        monitor.Stop();
+        return;
+    }
+    monitor.AddProtectedResource(static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino));
+
+    assert(monitor.Start() == true);
+    // Give the monitor thread a moment to be actively reading before we attack.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto try_open = [](const std::string& path) -> int {
+        pid_t pid = fork();
+        if (pid < 0) return -1;
+        if (pid == 0) {
+            int fd = open(path.c_str(), O_RDONLY);
+            if (fd < 0) _exit(errno);
+            close(fd);
+            _exit(0);
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) return -1;
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    };
+
+    int protected_rc = try_open(protected_path);
+    int open_rc = try_open(open_path);
+
+    unlink(protected_path.c_str());
+    unlink(open_path.c_str());
+    monitor.Stop();
+
+    std::cout << "  - Registered resource open() result: " << protected_rc
+              << " (expected EPERM=" << EPERM << ")" << std::endl;
+    std::cout << "  - Unregistered resource open() result: " << open_rc
+              << " (expected 0)" << std::endl;
+    assert(protected_rc == EPERM);
+    assert(open_rc == 0);
+
+    std::cout << "  - FAN_OPEN_PERM blocking verified." << std::endl;
+}
+
 int main() {
     std::cout << "==========================================\n";
     std::cout << "=== Running Fanotify Monitor Test Suite ==\n";
     std::cout << "==========================================\n";
     TestFanotifyLifecycle();
+    TestFanotifyOpenPermBlocking();
     std::cout << "\n>>> FANOTIFY MONITOR TEST PASSED successfully! <<<\n";
     return 0;
 }

@@ -48,7 +48,13 @@ int main(int argc, char* argv[]) {
         "kinnector-test-linux-ipc",
         "kinnector-test-ffi",
         "kinnector-test-ipc",
-        "kinnector-test-lsm"
+        "kinnector-test-lsm",
+        // Testing strategy item 6 (LINUX_COVERAGE_PLAN.md): now that Phase 3 lands
+        // resource_owner_map's MODE_WARDEN pass-through case, "run wardend's own
+        // test/verification path" (the Critical constraint's mandatory step for
+        // every phase touching kinnector.bpf.c) has a literal single command
+        // behind it instead of a vague manual smoke test.
+        "kinnector-test-enforcement-e2e"
     };
 
     std::vector<TestResult> results;

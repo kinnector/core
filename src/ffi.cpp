@@ -257,56 +257,92 @@ void stop_telemetry_engine() {
     std::cout << "[FFI] Telemetry Engine stopped." << std::endl;
 }
 
-bool add_sensitive_inode(uint64_t inode, uint32_t category) {
+bool add_sensitive_inode(uint64_t dev, uint64_t inode, uint32_t category) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
     if (g_loader && g_running) {
-        return g_loader->AddSensitiveInode(inode, category);
+        bool ok = g_loader->AddSensitiveInode(dev, inode, category);
+        // Phase 8 (LINUX_COVERAGE_PLAN.md): belt-and-suspenders -- also register
+        // with the fanotify fallback so the resource stays protected even on a
+        // kernel without BPF LSM support. Best-effort: the BPF-side result above
+        // is authoritative, this doesn't affect the return value.
+        if (g_fanotify) {
+            g_fanotify->AddProtectedResource(dev, inode);
+        }
+        return ok;
     }
 #endif
     return false;
 }
 
-bool add_protected_static_inode(uint64_t inode) {
+bool add_protected_static_inode(uint64_t dev, uint64_t inode) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
     if (g_loader && g_running) {
-        return g_loader->AddProtectedStaticInode(inode);
+        bool ok = g_loader->AddProtectedStaticInode(dev, inode);
+        if (g_fanotify) {
+            g_fanotify->AddProtectedResource(dev, inode);
+        }
+        return ok;
     }
 #endif
     return false;
 }
 
-bool remove_protected_static_inode(uint64_t inode) {
+bool remove_protected_static_inode(uint64_t dev, uint64_t inode) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
     if (g_loader && g_running) {
-        return g_loader->RemoveProtectedStaticInode(inode);
+        bool ok = g_loader->RemoveProtectedStaticInode(dev, inode);
+        if (g_fanotify) {
+            g_fanotify->RemoveProtectedResource(dev, inode);
+        }
+        return ok;
     }
 #endif
     return false;
 }
 
-bool add_bypassed_directory_inode(uint64_t inode) {
+bool add_bypassed_directory_inode(uint64_t dev, uint64_t inode) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
     if (g_loader && g_running) {
-        return g_loader->AddBypassedDirectoryInode(inode);
+        return g_loader->AddBypassedDirectoryInode(dev, inode);
     }
 #endif
     return false;
 }
 
-bool remove_bypassed_directory_inode(uint64_t inode) {
+bool remove_bypassed_directory_inode(uint64_t dev, uint64_t inode) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_LINUX)
     if (g_loader && g_running) {
-        return g_loader->RemoveBypassedDirectoryInode(inode);
+        return g_loader->RemoveBypassedDirectoryInode(dev, inode);
     }
 #endif
     return false;
 }
 
+
+bool add_resource_owner(uint64_t resource_dev, uint64_t resource_inode, uint64_t owner_exec_inode) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->AddResourceOwner(resource_dev, resource_inode, owner_exec_inode);
+    }
+#endif
+    return false;
+}
+
+bool remove_resource_owner(uint64_t resource_dev, uint64_t resource_inode, uint64_t owner_exec_inode) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_LINUX)
+    if (g_loader && g_running) {
+        return g_loader->RemoveResourceOwner(resource_dev, resource_inode, owner_exec_inode);
+    }
+#endif
+    return false;
+}
 
 bool add_trusted_exec_inode(uint64_t inode, uint32_t trust_level) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);

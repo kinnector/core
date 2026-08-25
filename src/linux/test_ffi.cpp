@@ -14,11 +14,11 @@ void TestFFILifecycleAndAPI() {
     std::cout << "[TestFFI] Testing FFI Lifecycle and C API exports..." << std::endl;
 
     // Before initialization or running, helper APIs should return false
-    assert(add_sensitive_inode(1, 1) == false);
-    assert(add_protected_static_inode(2) == false);
-    assert(remove_protected_static_inode(2) == false);
-    assert(add_bypassed_directory_inode(3) == false);
-    assert(remove_bypassed_directory_inode(3) == false);
+    assert(add_sensitive_inode(1, 1, 1) == false);
+    assert(add_protected_static_inode(1, 2) == false);
+    assert(remove_protected_static_inode(1, 2) == false);
+    assert(add_bypassed_directory_inode(1, 3) == false);
+    assert(remove_bypassed_directory_inode(1, 3) == false);
     assert(add_trusted_exec_inode(4, 1) == false);
     assert(is_trusted_exec_inode(4) == false);
     assert(set_config_value(0, 100) == false);
@@ -60,11 +60,11 @@ void TestFFILifecycleAndAPI() {
     assert(start_telemetry_engine() == false);
 
     // Now that engine is running (`g_running == true`), test all map and helper FFI exports
-    assert(add_sensitive_inode(1001, 1) == true);
-    assert(add_protected_static_inode(1002) == true);
-    assert(remove_protected_static_inode(1002) == true);
-    assert(add_bypassed_directory_inode(1003) == true);
-    assert(remove_bypassed_directory_inode(1003) == true);
+    assert(add_sensitive_inode(1, 1001, 1) == true);
+    assert(add_protected_static_inode(1, 1002) == true);
+    assert(remove_protected_static_inode(1, 1002) == true);
+    assert(add_bypassed_directory_inode(1, 1003) == true);
+    assert(remove_bypassed_directory_inode(1, 1003) == true);
     assert(add_trusted_exec_inode(1004, 5) == true);
     assert(is_trusted_exec_inode(1004) == false); // Mock mode returns false or lookup status
     assert(set_config_value(0, 42) == true);

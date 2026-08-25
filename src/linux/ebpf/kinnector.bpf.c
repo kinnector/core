@@ -19,6 +19,24 @@ struct process_key {
     uint64_t start_time;
 };
 
+// Phase 6 (LINUX_COVERAGE_PLAN.md): canonical resource identity. A raw i_ino
+// alone is ambiguous across bind-mounts/multiple filesystems with overlapping
+// inode ranges -- (dev, ino) is unique system-wide. Scoped to the
+// sensitive/protected-*file*-identity maps (sensitive_inodes_map,
+// protected_static_inodes, resource_owner_map, bypassed_directories,
+// newly_created_inodes) -- deliberately NOT applied to the exec-trust/binary-
+// identity maps (trusted_exec_inodes, exec_allowlist_map,
+// trusted_admin_binaries, install_binary_map, protected_owner_binaries),
+// which identify known system binaries at fixed, effectively single-filesystem
+// canonical paths (/usr/bin, /usr/sbin) where bind-mount collision is not a
+// realistic risk -- see this file's own header/[[linux_coverage_plan_phasing]]
+// memory for the scoping rationale. `dev` is dev_t (32-bit on Linux) widened
+// to uint64_t for a stable BPF map key layout.
+struct resource_id {
+    uint64_t dev;
+    uint64_t ino;
+};
+
 struct TelemetryHeader {
     uint64_t sequence_number;
     uint64_t timestamp_ns;
@@ -180,11 +198,12 @@ struct {
     __type(value, uint8_t);
 } trusted_ancestor_roots SEC(".maps");
 
-// Map: Inode -> Category ID
+// Map: (dev, Inode) -> Category ID. Phase 6: composite key, see resource_id's
+// declaration comment for the scoping rationale.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
-    __type(key, uint64_t);
+    __type(key, struct resource_id);
     __type(value, uint32_t);
 } sensitive_inodes_map SEC(".maps");
 
@@ -210,6 +229,15 @@ struct {
 #define CONFIG_HOST_MNT_NS       2
 #define CONFIG_HOST_PID_NS       3
 #define CONFIG_HOST_NET_NS       4
+// LINUX_COVERAGE_PLAN.md "Critical constraint": this file is shared production
+// code between wardend and antitheft-agent. CONFIG_DEPLOYMENT_MODE lets Antitheft-only
+// branches (Phase 3's resource_owner_map, Phase 5's protected_owner_pids) be gated
+// behind mode == MODE_ANTITHEFT, appended after Warden's existing checks and never
+// interleaved with them, so a MODE_WARDEN deployment (or one that never sets this key
+// at all, e.g. an unrelated old build) takes the exact same code path it does today.
+#define CONFIG_DEPLOYMENT_MODE   5
+#define MODE_WARDEN              1
+#define MODE_ANTITHEFT           2
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -217,6 +245,23 @@ struct {
     __type(key, uint32_t);
     __type(value, uint32_t);
 } config_map SEC(".maps");
+
+// Phase 3 (LINUX_COVERAGE_PLAN.md): Antitheft-only, MODE_ANTITHEFT-gated.
+// Key: a protected resource's (dev, inode) identity (Phase 6 composite key;
+// same identity space as sensitive_inodes_map/protected_static_inodes). Value:
+// a 64-slot bitmask; each legitimate owner process is represented by hashing
+// its executable's inode into one of 64 slots (see resource_owner_hash()
+// below) and setting that bit. This trades a small, bounded
+// false-negative-owner rate under hash collision (undercounts as "not an
+// owner" only when two configured owners collide into the same slot, which then
+// both still match) for a fixed-size BPF map value — a full inode set isn't
+// representable as a single BPF hash-map value.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct resource_id);
+    __type(value, uint64_t);
+} resource_owner_map SEC(".maps");
 
 // Map: (pid, start_time) -> exfiltration taint hops
 struct {
@@ -226,19 +271,23 @@ struct {
     __type(value, uint32_t);
 } tainted_process_map SEC(".maps");
 
-// Map: directory inode -> 1 (bypass telemetry for DB data dirs).
-// Only honoured for processes with ROLE_DATABASE set in process_threshold_map.
+// Map: (dev, directory inode) -> 1 (bypass telemetry for DB data dirs). Phase 6:
+// composite key. Only honoured for processes with ROLE_DATABASE set in
+// process_threshold_map.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, uint64_t);   // directory inode number
+    __type(key, struct resource_id);
     __type(value, uint8_t);  // 1 = bypass
 } bypassed_directories SEC(".maps");
 
+// Phase 2 (LINUX_COVERAGE_PLAN.md): keyed on (pid, start_time), not raw pid —
+// a raw-pid key let a since-exited npm-descended process's TREE_INSTALL_CONTEXT
+// stamp be inherited by an unrelated new process that reuses the same PID.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
-    __type(key, uint32_t);
+    __type(key, struct process_key);
     __type(value, uint32_t);
 } pid_tree_type_map SEC(".maps");
 
@@ -287,6 +336,43 @@ struct {
     __type(value, uint8_t);
 } trusted_admin_binaries SEC(".maps");
 
+// Phase 4 (LINUX_COVERAGE_PLAN.md): userspace-populated, sourced from
+// protect-community/configs/warden/package_manager_signatures.json via
+// kinnector_config's package_manager_signatures() — replaces is_install_binary()'s
+// old hardcoded string scan so adding a new ecosystem is a config change, not a
+// kernel-object rebuild. Key: the resolved package-manager binary's inode.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, uint64_t);
+    __type(value, uint8_t);
+} install_binary_map SEC(".maps");
+
+// Phase 5 (LINUX_COVERAGE_PLAN.md): Antitheft-only, config-driven list of binaries
+// that should get the same ptrace/signal owner-process protection Warden's own
+// binary and TREE_ADMIN_SESSION processes already get -- e.g. a password manager.
+// Same shape/population convention as install_binary_map (Phase 4): key = the
+// configured owner binary's inode.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, uint64_t);
+    __type(value, uint8_t);
+} protected_owner_binaries SEC(".maps");
+
+// Phase 5: (pid, start_time) -> 1, stamped at exec time in bprm_creds_for_exec
+// when the exec'd binary's inode matches protected_owner_binaries -- mirrors
+// admin_session_pids' own "detect a pattern at exec/login time, stamp the
+// process" population shape, but correctly keyed on process_key from the start
+// (admin_session_pids predates the Phase 2 fix and is intentionally left alone,
+// out of that phase's scope -- no reason to inherit its raw-pid key here too).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct process_key);
+    __type(value, uint8_t);
+} protected_owner_pids SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
@@ -294,17 +380,19 @@ struct {
     __type(value, uint8_t);
 } admin_session_pids SEC(".maps");
 
+// Phase 6: composite key.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16384);
-    __type(key, uint64_t);
+    __type(key, struct resource_id);
     __type(value, uint8_t);
 } newly_created_inodes SEC(".maps");
 
+// Phase 6: composite key.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
-    __type(key, uint64_t);
+    __type(key, struct resource_id);
     __type(value, uint8_t);
 } protected_static_inodes SEC(".maps");
 
@@ -567,9 +655,38 @@ static __always_inline int is_container_restricted() {
     return 1; // Restricted container process
 }
 
+static __always_inline struct process_key get_current_process_key() {
+    struct process_key key = {0};
+    uint64_t pid_tgid = bpf_get_current_pid_tgid();
+    key.pid = pid_tgid >> 32;
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (task) {
+        bpf_probe_read_kernel(&key.start_time, sizeof(key.start_time), &task->start_time);
+    }
+    return key;
+}
+
+// Phase 6 (LINUX_COVERAGE_PLAN.md): build the canonical (dev, ino) identity for
+// a resolved struct inode. Returns a zeroed id (dev=0, ino=0) if inode is NULL
+// or its superblock can't be read -- callers already guard on inode != NULL
+// before calling this in every current use site, so a zero id is only reached
+// on the (extremely rare) i_sb read failure, at which point it simply won't
+// match any real registered resource.
+static __always_inline struct resource_id make_resource_id(struct inode *inode) {
+    struct resource_id id = {0};
+    if (!inode)
+        return id;
+    id.ino = BPF_CORE_READ(inode, i_ino);
+    struct super_block *sb = BPF_CORE_READ(inode, i_sb);
+    if (sb) {
+        id.dev = BPF_CORE_READ(sb, s_dev);
+    }
+    return id;
+}
+
 static __always_inline int is_admin_session() {
-    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
-    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
+    struct process_key key = get_current_process_key();
+    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &key);
     if (tree_type && (*tree_type & TREE_ADMIN_SESSION)) {
         return 1;
     }
@@ -577,12 +694,52 @@ static __always_inline int is_admin_session() {
 }
 
 static __always_inline int is_install_session() {
-    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
-    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
+    struct process_key key = get_current_process_key();
+    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &key);
     if (tree_type && (*tree_type & TREE_INSTALL_CONTEXT)) {
         return 1;
     }
     return 0;
+}
+
+// Phase 3 (LINUX_COVERAGE_PLAN.md): true only for an antitheft-agent deployment
+// that has set CONFIG_DEPLOYMENT_MODE == MODE_ANTITHEFT via set_config_value().
+// A Warden deployment (mode unset, or explicitly MODE_WARDEN) always gets 0 here.
+static __always_inline int is_antitheft_mode() {
+    uint32_t idx = CONFIG_DEPLOYMENT_MODE;
+    uint32_t *mode = bpf_map_lookup_elem(&config_map, &idx);
+    return (mode && *mode == MODE_ANTITHEFT);
+}
+
+// Knuth multiplicative hash, folded into a 6-bit slot (0-63) for resource_owner_map's
+// bitmask representation — see the map's declaration comment for the collision tradeoff.
+static __always_inline uint32_t resource_owner_hash(uint64_t exec_ino) {
+    return (uint32_t)((exec_ino * 2654435761ULL) & 0x3FULL);
+}
+
+// Phase 3's load-bearing check: is the *currently executing* process one of the
+// configured legitimate owners of `resource`? Resources with no
+// resource_owner_map entry at all are untouched by this phase (returns 1/allow) —
+// Phase 3 only enforces the allowlist for resources Antitheft explicitly opted in.
+// Phase 6: `resource` is the canonical (dev, ino) identity, not a bare inode.
+static __always_inline int is_resource_owner(struct resource_id resource) {
+    uint64_t *owner_mask = bpf_map_lookup_elem(&resource_owner_map, &resource);
+    if (!owner_mask) {
+        return 1;
+    }
+
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+    struct mm_struct *mm = BPF_CORE_READ(task, mm);
+    if (!mm) return 0;
+    struct file *exe_file = BPF_CORE_READ(mm, exe_file);
+    if (!exe_file) return 0;
+    struct inode *exe_inode = BPF_CORE_READ(exe_file, f_inode);
+    if (!exe_inode) return 0;
+    uint64_t exe_ino = BPF_CORE_READ(exe_inode, i_ino);
+
+    uint64_t bit = 1ULL << resource_owner_hash(exe_ino);
+    return (*owner_mask & bit) != 0;
 }
 
 // Firewall egress check — LPM longest-prefix lookup against fw_rules_v4/v6.
@@ -614,41 +771,6 @@ static __always_inline int fw_check_egress(unsigned short family, uint32_t dest_
     return 0;
 }
 
-
-static __always_inline bool is_install_binary(const char *name) {
-    #pragma unroll
-    for (int i = 0; i < 90; i++) {
-        if (name[i] == '\0') break;
-        if (name[i] == '/' && name[i+1] == 'n' && name[i+2] == 'p' && name[i+3] == 'm') return true;
-        if (name[i] == '/' && name[i+1] == 'y' && name[i+2] == 'a' && name[i+3] == 'r' && name[i+4] == 'n') return true;
-        if (name[i] == '/' && name[i+1] == 'p' && name[i+2] == 'n' && name[i+3] == 'p' && name[i+4] == 'm') return true;
-        if (name[i] == '/' && name[i+1] == 'p' && name[i+2] == 'i' && name[i+3] == 'p') return true;
-        if (name[i] == '/' && name[i+1] == 'c' && name[i+2] == 'o' && name[i+3] == 'm' && name[i+4] == 'p' && name[i+5] == 'o' && name[i+6] == 's' && name[i+7] == 'e' && name[i+8] == 'r') return true;
-        if (name[i] == '/' && name[i+1] == 'c' && name[i+2] == 'a' && name[i+3] == 'r' && name[i+4] == 'g' && name[i+5] == 'o') return true;
-        if (name[i] == '/' && name[i+1] == 'g' && name[i+2] == 'e' && name[i+3] == 'm') return true;
-        if (name[i] == '/' && name[i+1] == 'b' && name[i+2] == 'u' && name[i+3] == 'n' && name[i+4] == 'd' && name[i+5] == 'l' && name[i+6] == 'e') return true;
-        if (name[i] == '/' && name[i+1] == 'g' && name[i+2] == 'r' && name[i+3] == 'a' && name[i+4] == 'd' && name[i+5] == 'l' && name[i+6] == 'e') return true;
-        if (name[i] == '/' && name[i+1] == 'm' && name[i+2] == 'v' && name[i+3] == 'n') return true;
-        if (name[i] == '/' && name[i+1] == 'a' && name[i+2] == 'p' && name[i+3] == 't') return true;
-        if (name[i] == '/' && name[i+1] == 'd' && name[i+2] == 'p' && name[i+3] == 'k' && name[i+4] == 'g') return true;
-    }
-    if (name[0] == 'n' && name[1] == 'p' && name[2] == 'm' && name[3] == '\0') return true;
-    if (name[0] == 'y' && name[1] == 'a' && name[2] == 'r' && name[3] == 'n' && name[4] == '\0') return true;
-    if (name[0] == 'p' && name[1] == 'i' && name[2] == 'p' && name[3] == '\0') return true;
-    if (name[0] == 'c' && name[1] == 'a' && name[2] == 'r' && name[3] == 'g' && name[4] == 'o' && name[5] == '\0') return true;
-    return false;
-}
-
-static __always_inline struct process_key get_current_process_key() {
-    struct process_key key = {0};
-    uint64_t pid_tgid = bpf_get_current_pid_tgid();
-    key.pid = pid_tgid >> 32;
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (task) {
-        bpf_probe_read_kernel(&key.start_time, sizeof(key.start_time), &task->start_time);
-    }
-    return key;
-}
 
 // P2-9: Increment and return a monotonic sequence number
 static __always_inline uint64_t next_seq() {
@@ -980,6 +1102,7 @@ int BPF_PROG(file_open, struct file *file, int mask) {
         return 0;
 
     uint64_t ino = BPF_CORE_READ(inode, i_ino);
+    struct resource_id res_id = make_resource_id(inode); // Phase 6: canonical (dev, ino) identity
 
     // 1. Procfs, input device and uinput protection (synchronous vetoes)
     if (blocking_enabled) {
@@ -1030,7 +1153,7 @@ int BPF_PROG(file_open, struct file *file, int mask) {
     }
 
     // 2. Sensitive files protection
-    uint32_t *category = bpf_map_lookup_elem(&sensitive_inodes_map, &ino);
+    uint32_t *category = bpf_map_lookup_elem(&sensitive_inodes_map, &res_id);
     if (!category)
         return 0;
 
@@ -1053,6 +1176,25 @@ int BPF_PROG(file_open, struct file *file, int mask) {
             }
             return -EACCES; // Block synchronously!
         }
+    }
+
+    // Phase 3 (LINUX_COVERAGE_PLAN.md): Antitheft-only owner-allowlist enforcement,
+    // appended after Warden's existing threshold-based deny above, never interleaved
+    // with it. A MODE_WARDEN deployment never calls is_antitheft_mode() true, so its
+    // file_open behavior for sensitive-category files is byte-for-byte unchanged.
+    if (blocking_enabled && is_antitheft_mode() && !is_resource_owner(res_id)) {
+        struct TelemetryEvent *deny_event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+        if (deny_event) {
+            fill_header(deny_event, EVT_FILE_READ, SRC_BPF_LSM, key.pid);
+            deny_event->details.file_read.bytes_requested = 0;
+            deny_event->details.file_read.zone_id = 0;
+            struct qstr d_name;
+            bpf_probe_read_kernel(&d_name, sizeof(d_name), &BPF_CORE_READ(file, f_path.dentry)->d_name);
+            bpf_probe_read_kernel_str(&deny_event->details.file_read.file_path,
+                                      sizeof(deny_event->details.file_read.file_path), d_name.name);
+            bpf_ringbuf_submit(deny_event, 0);
+        }
+        return -EACCES; // Refused before it completes: not a configured owner of this resource.
     }
 
     uint32_t *flags = bpf_map_lookup_elem(&category_flags_map, &key);
@@ -1114,12 +1256,23 @@ int BPF_PROG(file_permission, struct file *file, int mask) {
     if (blocking_enabled) {
         struct inode *inode = BPF_CORE_READ(file, f_inode);
         if (inode) {
-            uint64_t ino = BPF_CORE_READ(inode, i_ino);
-            uint8_t *is_protected = bpf_map_lookup_elem(&protected_static_inodes, &ino);
+            struct resource_id res_id = make_resource_id(inode); // Phase 6
+            uint8_t *is_protected = bpf_map_lookup_elem(&protected_static_inodes, &res_id);
             if (is_protected && *is_protected == 1) {
                 if (threshold && *threshold > 0) {
                     return -EACCES; // Block writing to pre-existing static web-root/config files!
                 }
+            }
+
+            // Phase 3 (LINUX_COVERAGE_PLAN.md): Antitheft-only owner-allowlist
+            // enforcement, appended after Warden's existing protected_static_inodes
+            // deny above, never interleaved with it — a MODE_WARDEN deployment never
+            // calls is_antitheft_mode() true, so its file_permission behavior is
+            // byte-for-byte unchanged. Independent of protected_static_inodes: a
+            // resource can be owner-tracked (e.g. a wallet file) without being one
+            // of Warden's web-root files.
+            if (is_antitheft_mode() && !is_resource_owner(res_id)) {
+                return -EACCES; // Refused before it completes: not a configured owner of this resource.
             }
         }
     }
@@ -1134,8 +1287,8 @@ int BPF_PROG(file_permission, struct file *file, int mask) {
             if (!dentry) break;
             struct inode *dir_inode = BPF_CORE_READ(dentry, d_inode);
             if (dir_inode) {
-                uint64_t ino = BPF_CORE_READ(dir_inode, i_ino);
-                uint8_t *bypass = bpf_map_lookup_elem(&bypassed_directories, &ino);
+                struct resource_id dir_id = make_resource_id(dir_inode); // Phase 6
+                uint8_t *bypass = bpf_map_lookup_elem(&bypassed_directories, &dir_id);
                 if (bypass && *bypass == 1)
                     return 0;
             }
@@ -1146,9 +1299,9 @@ int BPF_PROG(file_permission, struct file *file, int mask) {
     if (threshold && *threshold > 0) {
         struct inode *inode = BPF_CORE_READ(file, f_inode);
         if (inode) {
-            uint64_t ino = BPF_CORE_READ(inode, i_ino);
+            struct resource_id new_id = make_resource_id(inode); // Phase 6
             uint8_t val = 1;
-            bpf_map_update_elem(&newly_created_inodes, &ino, &val, BPF_ANY);
+            bpf_map_update_elem(&newly_created_inodes, &new_id, &val, BPF_ANY);
         }
     }
 
@@ -1463,22 +1616,39 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         return 0;
 
     struct process_key key = get_current_process_key();
-    
-    // Check if executing a package manager/install binary to mark the process tree as TREE_INSTALL_CONTEXT
-    const char *filename_ptr = 0;
-    bpf_probe_read_kernel(&filename_ptr, sizeof(filename_ptr), &bprm->filename);
-    if (filename_ptr) {
-        char filename[128] = {0};
-        bpf_probe_read_kernel_str(filename, sizeof(filename), filename_ptr);
-        if (is_install_binary(filename)) {
-            uint32_t pid = key.pid;
-            uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &pid);
+
+    // Phase 4 (LINUX_COVERAGE_PLAN.md): package-manager/install-binary detection is
+    // now inode-based against install_binary_map (userspace-populated from
+    // package_manager_signatures.json via kinnector_config), not a hardcoded filename
+    // substring scan -- adding a new ecosystem is a config change, not a rebuild.
+    struct inode *bin_inode = BPF_CORE_READ(bprm, file, f_inode);
+    uint64_t bin_ino = bin_inode ? BPF_CORE_READ(bin_inode, i_ino) : 0;
+    if (bin_inode) {
+        uint8_t *is_install_bin = bpf_map_lookup_elem(&install_binary_map, &bin_ino);
+        if (is_install_bin && *is_install_bin == 1) {
+            uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &key);
             if (tree_type) {
                 *tree_type &= ~TREE_ADMIN_SESSION;
                 *tree_type |= TREE_INSTALL_CONTEXT;
             } else {
                 uint32_t val = TREE_INSTALL_CONTEXT;
-                bpf_map_update_elem(&pid_tree_type_map, &pid, &val, BPF_ANY);
+                bpf_map_update_elem(&pid_tree_type_map, &key, &val, BPF_ANY);
+            }
+        }
+
+        // Phase 5 (LINUX_COVERAGE_PLAN.md): Antitheft-only, appended after Warden's
+        // install-binary marking above, never interleaved with it. Stamps
+        // protected_owner_pids when the exec'd binary matches a configured owner
+        // binary (e.g. a password manager) -- ptrace_access_check/task_kill below
+        // consult this to extend the same protection TREE_ADMIN_SESSION processes
+        // already get. A MODE_WARDEN deployment never calls is_antitheft_mode()
+        // true, so protected_owner_binaries/protected_owner_pids stay untouched
+        // for it regardless of what's compiled in.
+        if (is_antitheft_mode()) {
+            uint8_t *is_owner_bin = bpf_map_lookup_elem(&protected_owner_binaries, &bin_ino);
+            if (is_owner_bin && *is_owner_bin == 1) {
+                uint8_t val = 1;
+                bpf_map_update_elem(&protected_owner_pids, &key, &val, BPF_ANY);
             }
         }
     }
@@ -1493,20 +1663,17 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         return -EACCES;
     }
     // 1. If executing a trusted admin binary (like logrotate), mark the process tree as TRUSTED_ADMIN
-    struct inode *bin_inode = BPF_CORE_READ(bprm, file, f_inode);
     if (bin_inode) {
-        uint64_t ino = BPF_CORE_READ(bin_inode, i_ino);
+        uint64_t ino = bin_ino;
         uint8_t *is_admin_bin = bpf_map_lookup_elem(&trusted_admin_binaries, &ino);
         if (is_admin_bin && *is_admin_bin == 1) {
-            uint32_t pid = key.pid;
             uint32_t val = TREE_TRUSTED_ADMIN;
-            bpf_map_update_elem(&pid_tree_type_map, &pid, &val, BPF_ANY);
+            bpf_map_update_elem(&pid_tree_type_map, &key, &val, BPF_ANY);
         }
     }
 
     // 2. Enforce execution restrictions on TREE_TRUSTED_ADMIN processes
-    uint32_t current_pid = key.pid;
-    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &current_pid);
+    uint32_t *tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &key);
     if (tree_type && (*tree_type & TREE_TRUSTED_ADMIN)) {
         struct dentry *dentry = BPF_CORE_READ(bprm, file, f_path.dentry);
         if (dentry) {
@@ -1637,7 +1804,7 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
                 // Yes! This is a login session with a TTY/PTY. Stamp it as TREE_ADMIN_SESSION!
                 uint32_t pid = key.pid;
                 uint32_t flag = TREE_ADMIN_SESSION;
-                bpf_map_update_elem(&pid_tree_type_map, &pid, &flag, BPF_ANY);
+                bpf_map_update_elem(&pid_tree_type_map, &key, &flag, BPF_ANY);
                 uint8_t allowed = 1;
                 bpf_map_update_elem(&admin_session_pids, &pid, &allowed, BPF_ANY);
             }
@@ -1681,8 +1848,8 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         if (bprm_file) {
             struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
             if (inode) {
-                uint64_t ino = BPF_CORE_READ(inode, i_ino);
-                uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &ino);
+                struct resource_id exec_id = make_resource_id(inode); // Phase 6
+                uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &exec_id);
                 if (is_newly_created && *is_newly_created == 1) {
                     if (active_threshold && *active_threshold > 0) {
                         if (!is_install_session()) {
@@ -1858,9 +2025,10 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm) {
         struct inode *inode = BPF_CORE_READ(bprm_file, f_inode);
         if (inode) {
             uint64_t ino = BPF_CORE_READ(inode, i_ino);
-            
+            struct resource_id exec_id = make_resource_id(inode); // Phase 6
+
             // Re-validate against newly_created_inodes (untrusted/tampered)
-            uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &ino);
+            uint8_t *is_newly_created = bpf_map_lookup_elem(&newly_created_inodes, &exec_id);
             if (is_newly_created && *is_newly_created == 1) {
                 if (thresh_val > 0) {
                     if (!is_install_session()) {
@@ -1903,13 +2071,29 @@ int BPF_PROG(ptrace_access_check, struct task_struct *child, unsigned int mode) 
     struct process_key key = get_current_process_key();
     uint32_t tracee_pid = BPF_CORE_READ(child, tgid);
     uint32_t tracer_pid = key.pid;
+    struct process_key tracee_key = { tracee_pid, BPF_CORE_READ(child, start_time) };
 
     // Protect admin session from ptrace attempts by non-admin processes
-    uint32_t *tracee_tree = bpf_map_lookup_elem(&pid_tree_type_map, &tracee_pid);
+    uint32_t *tracee_tree = bpf_map_lookup_elem(&pid_tree_type_map, &tracee_key);
     if (tracee_tree && (*tracee_tree & TREE_ADMIN_SESSION)) {
-        uint32_t *tracer_tree = bpf_map_lookup_elem(&pid_tree_type_map, &tracer_pid);
+        uint32_t *tracer_tree = bpf_map_lookup_elem(&pid_tree_type_map, &key);
         if (!tracer_tree || !(*tracer_tree & TREE_ADMIN_SESSION)) {
             return -EACCES; // Block non-admin tracing admin process!
+        }
+    }
+
+    // Phase 5 (LINUX_COVERAGE_PLAN.md): Antitheft-only, generalizes the
+    // TREE_ADMIN_SESSION protection above to any configured owner process (e.g.
+    // a password manager), via protected_owner_pids -- appended after Warden's
+    // existing admin-session check, never interleaved with it, so a MODE_WARDEN
+    // deployment's ptrace_access_check behavior is byte-for-byte unchanged.
+    if (is_antitheft_mode()) {
+        uint8_t *tracee_protected = bpf_map_lookup_elem(&protected_owner_pids, &tracee_key);
+        if (tracee_protected && *tracee_protected == 1) {
+            uint8_t *tracer_protected = bpf_map_lookup_elem(&protected_owner_pids, &key);
+            if (!tracer_protected || *tracer_protected != 1) {
+                return -EACCES; // Block unprivileged process from ptrace'ing a protected owner process!
+            }
         }
     }
 
@@ -1953,6 +2137,8 @@ int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int 
 
     uint32_t target_pid = BPF_CORE_READ(p, tgid);
     uint32_t current_pid = bpf_get_current_pid_tgid() >> 32;
+    struct process_key target_key = { target_pid, BPF_CORE_READ(p, start_time) };
+    struct process_key current_key = get_current_process_key();
 
     // Ignore self-signals
     if (target_pid == current_pid) return 0;
@@ -1963,7 +2149,7 @@ int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int 
     int is_target_warden = (target_comm[0] == 'w' && target_comm[1] == 'a' && target_comm[2] == 'r' && target_comm[3] == 'd' && target_comm[4] == 'e' && target_comm[5] == 'n');
 
     // Check if target is admin session
-    uint32_t *target_tree = bpf_map_lookup_elem(&pid_tree_type_map, &target_pid);
+    uint32_t *target_tree = bpf_map_lookup_elem(&pid_tree_type_map, &target_key);
     int is_target_admin = (target_tree && (*target_tree & TREE_ADMIN_SESSION));
 
     if (is_target_warden || is_target_admin) {
@@ -1974,9 +2160,9 @@ int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int 
             bpf_probe_read_kernel_str(current_comm, sizeof(current_comm), &task->comm);
         }
         int is_sender_warden = (current_comm[0] == 'w' && current_comm[1] == 'a' && current_comm[2] == 'r' && current_comm[3] == 'd' && current_comm[4] == 'e' && current_comm[5] == 'n');
-        
+
         // Allow if sender is admin session
-        uint32_t *sender_tree = bpf_map_lookup_elem(&pid_tree_type_map, &current_pid);
+        uint32_t *sender_tree = bpf_map_lookup_elem(&pid_tree_type_map, &current_key);
         int is_sender_admin = (sender_tree && (*sender_tree & TREE_ADMIN_SESSION));
 
         if (!is_sender_warden && !is_sender_admin) {
@@ -1991,9 +2177,28 @@ int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int 
         }
     }
 
+    // Phase 5 (LINUX_COVERAGE_PLAN.md): Antitheft-only, same generalization as
+    // ptrace_access_check above -- appended after Warden's existing Warden-comm/
+    // admin-session check, never interleaved with it.
+    if (is_antitheft_mode()) {
+        uint8_t *target_protected = bpf_map_lookup_elem(&protected_owner_pids, &target_key);
+        if (target_protected && *target_protected == 1) {
+            uint8_t *sender_protected = bpf_map_lookup_elem(&protected_owner_pids, &current_key);
+            if (!sender_protected || *sender_protected != 1) {
+                struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
+                if (event) {
+                    fill_header(event, 23, SRC_BPF_LSM, current_pid); // EVT_SIGNAL_DELIVERY = 23
+                    bpf_probe_read_kernel(event->details.details_buffer, 4, &target_pid);
+                    bpf_probe_read_kernel(event->details.details_buffer + 4, 4, &sig);
+                    bpf_ringbuf_submit(event, 0);
+                }
+                return -EPERM; // Block unprivileged process from signaling a protected owner process!
+            }
+        }
+    }
+
     if (sig == 9 || sig == 19) {
-        struct process_key key = get_current_process_key();
-        uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &key);
+        uint32_t *threshold = bpf_map_lookup_elem(&process_threshold_map, &current_key);
         if (threshold) {
             struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
             if (event) {
@@ -2252,9 +2457,10 @@ int tracepoint_sched_process_exit(struct trace_event_raw_sched_process_template 
     bpf_map_delete_elem(&process_threshold_map,    &key);
     bpf_map_delete_elem(&tainted_process_map,      &key);
     uint32_t pid = key.pid;
-    bpf_map_delete_elem(&pid_tree_type_map,        &pid);
+    bpf_map_delete_elem(&pid_tree_type_map,        &key);
     bpf_map_delete_elem(&jvm_exception_pids,       &pid);
     bpf_map_delete_elem(&admin_session_pids,       &pid);
+    bpf_map_delete_elem(&protected_owner_pids,     &key); // Phase 5
 
     struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
     if (event) {
@@ -2289,13 +2495,20 @@ int tracepoint_sched_process_fork(struct sched_process_fork_args *ctx) {
     bpf_probe_read_kernel(&parent_key.start_time, sizeof(parent_key.start_time),
                           &task->start_time);
 
+    // Child key: pid from fork args; start_time filled from child task
+    // The child's start_time is not yet stable at fork, so we use parent's start_time
+    // as a temporary seed — user-space will correct it on next ProcessCreate event.
+    struct process_key child_key = {0};
+    child_key.pid = ctx->child_pid;
+    child_key.start_time = parent_key.start_time; // best-effort at fork time
+
     // Propagate pid_tree_type_map
     uint32_t parent_pid = ctx->parent_pid;
     uint32_t child_pid = ctx->child_pid;
-    uint32_t *parent_tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &parent_pid);
+    uint32_t *parent_tree_type = bpf_map_lookup_elem(&pid_tree_type_map, &parent_key);
     if (parent_tree_type) {
         uint32_t val = *parent_tree_type;
-        bpf_map_update_elem(&pid_tree_type_map, &child_pid, &val, BPF_ANY);
+        bpf_map_update_elem(&pid_tree_type_map, &child_key, &val, BPF_ANY);
     }
 
     // Propagate jvm_exception_pids
@@ -2323,13 +2536,6 @@ int tracepoint_sched_process_fork(struct sched_process_fork_args *ctx) {
             return 0;
         }
     }
-
-    // Child key: pid from fork args; start_time filled from child task
-    // The child's start_time is not yet stable at fork, so we use parent's start_time
-    // as a temporary seed — user-space will correct it on next ProcessCreate event.
-    struct process_key child_key = {0};
-    child_key.pid = ctx->child_pid;
-    child_key.start_time = parent_key.start_time; // best-effort at fork time
 
     if (parent_threshold) {
         uint32_t val = *parent_threshold;

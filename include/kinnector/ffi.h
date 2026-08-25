@@ -28,16 +28,29 @@ KINNECTOR_API bool start_telemetry_engine();
 // Stop the telemetry engine (unloading hooks and disconnecting IPC)
 KINNECTOR_API void stop_telemetry_engine();
 
-// Populate sensitive inode category mappings
-KINNECTOR_API bool add_sensitive_inode(uint64_t inode, uint32_t category);
-KINNECTOR_API bool add_protected_static_inode(uint64_t inode);
-KINNECTOR_API bool remove_protected_static_inode(uint64_t inode);
+// Populate sensitive inode category mappings. Phase 6 (LINUX_COVERAGE_PLAN.md):
+// `dev` (st_dev/dev_t, widened) makes the identity canonical across
+// bind-mounts/multiple filesystems with overlapping inode ranges — a bare
+// inode number alone is ambiguous. See kinnector.bpf.c's resource_id
+// declaration comment for which maps this applies to and why.
+KINNECTOR_API bool add_sensitive_inode(uint64_t dev, uint64_t inode, uint32_t category);
+KINNECTOR_API bool add_protected_static_inode(uint64_t dev, uint64_t inode);
+KINNECTOR_API bool remove_protected_static_inode(uint64_t dev, uint64_t inode);
 
 // Register a directory inode as a DB data-dir bypass (suppresses telemetry for DB processes)
-KINNECTOR_API bool add_bypassed_directory_inode(uint64_t inode);
+KINNECTOR_API bool add_bypassed_directory_inode(uint64_t dev, uint64_t inode);
 
 // Remove a directory inode from the DB bypass map (called on DB process stop / upgrade)
-KINNECTOR_API bool remove_bypassed_directory_inode(uint64_t inode);
+KINNECTOR_API bool remove_bypassed_directory_inode(uint64_t dev, uint64_t inode);
+
+// Phase 3 (LINUX_COVERAGE_PLAN.md): register/unregister a legitimate owner process
+// (identified by its executable's bare inode — Phase 6's dev+inode compositing
+// applies to the protected *resource* side only, not this lossy owner-hash
+// bucket input) for a protected resource identified by (resource_dev,
+// resource_inode). Antitheft-only — the kernel side only ever consults this
+// once CONFIG_DEPLOYMENT_MODE == MODE_ANTITHEFT has been set via set_config_value.
+KINNECTOR_API bool add_resource_owner(uint64_t resource_dev, uint64_t resource_inode, uint64_t owner_exec_inode);
+KINNECTOR_API bool remove_resource_owner(uint64_t resource_dev, uint64_t resource_inode, uint64_t owner_exec_inode);
 
 // Populate trusted executable inodes mappings
 KINNECTOR_API bool add_trusted_exec_inode(uint64_t inode, uint32_t trust_level);
