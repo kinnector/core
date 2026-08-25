@@ -133,6 +133,11 @@ bool initialize_telemetry_engine(const char* bpf_obj_path, const char* socket_pa
     }
 
     g_fanotify = std::make_unique<kinnector::lnx::FanotifyMonitor>();
+    // enable_blocking intentionally omitted (defaults false): this Initialize()
+    // call marks the ROOT filesystem. Passing true here would arm FAN_OPEN_PERM
+    // mount-wide, blocking every open() on the whole machine on this one
+    // monitor thread -- see fanotify.h's Initialize() comment. Never flip this
+    // without the per-path-mark follow-up documented there.
     if (!g_fanotify || !g_fanotify->Initialize("/")) {
         std::cerr << "[FFI] Warning: Fanotify FIM failed to initialize. Continuing with eBPF only." << std::endl;
         g_fanotify.reset();
@@ -265,9 +270,13 @@ bool add_sensitive_inode(uint64_t dev, uint64_t inode, uint32_t category) {
         // Phase 8 (LINUX_COVERAGE_PLAN.md): belt-and-suspenders -- also register
         // with the fanotify fallback so the resource stays protected even on a
         // kernel without BPF LSM support. Best-effort: the BPF-side result above
-        // is authoritative, this doesn't affect the return value.
+        // is authoritative, this doesn't affect the return value. No path
+        // available at this call site (Rust passes dev+inode only), so this is
+        // tracked in-memory only -- no live FAN_OPEN_PERM mark -- and is a
+        // no-op either way while g_fanotify's Initialize() call keeps
+        // enable_blocking at its default false (see that call site).
         if (g_fanotify) {
-            g_fanotify->AddProtectedResource(dev, inode);
+            g_fanotify->AddProtectedResource("", dev, inode);
         }
         return ok;
     }
@@ -281,7 +290,7 @@ bool add_protected_static_inode(uint64_t dev, uint64_t inode) {
     if (g_loader && g_running) {
         bool ok = g_loader->AddProtectedStaticInode(dev, inode);
         if (g_fanotify) {
-            g_fanotify->AddProtectedResource(dev, inode);
+            g_fanotify->AddProtectedResource("", dev, inode);
         }
         return ok;
     }
@@ -295,7 +304,7 @@ bool remove_protected_static_inode(uint64_t dev, uint64_t inode) {
     if (g_loader && g_running) {
         bool ok = g_loader->RemoveProtectedStaticInode(dev, inode);
         if (g_fanotify) {
-            g_fanotify->RemoveProtectedResource(dev, inode);
+            g_fanotify->RemoveProtectedResource("", dev, inode);
         }
         return ok;
     }

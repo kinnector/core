@@ -17,26 +17,35 @@ FanotifyMonitor::~FanotifyMonitor() {
     Stop();
 }
 
-bool FanotifyMonitor::Initialize(const std::string& mount_path) {
+bool FanotifyMonitor::Initialize(const std::string& mount_path, bool enable_blocking) {
     if (initialized_) {
         return false;
     }
 
     mount_path_ = mount_path;
 
-    // Phase 8 (LINUX_COVERAGE_PLAN.md): try a permission-event-capable group
-    // first (FAN_CLASS_CONTENT) so FAN_OPEN_PERM marks below can actually block,
-    // not just notify -- belt-and-suspenders for kernels without BPF LSM
-    // support. FAN_CLASS_CONTENT requires the fd to be read-write. Falls back to
-    // the original notify-only FAN_CLASS_NOTIF group (unprivileged/unsupported
-    // kernels, e.g. inside some containers) so FIM telemetry keeps working even
-    // when permission events can't be set up.
-    fanotify_fd_ = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDWR | O_LARGEFILE);
-    if (fanotify_fd_ >= 0) {
-        permission_capable_ = true;
+    // Phase 8 (LINUX_COVERAGE_PLAN.md), post-incident revision: FAN_CLASS_CONTENT
+    // (permission-event-capable) is only ever attempted when the caller
+    // explicitly opts in via enable_blocking=true -- see this method's
+    // declaration comment in fanotify.h for why. Marking a real mount
+    // (especially "/") with FAN_MARK_MOUNT + FAN_OPEN_PERM makes every open()
+    // by every process on that mount block on this object's one monitor
+    // thread; this took the whole dev machine down the first time it actually
+    // ran, because it had only ever run non-root before (fanotify_init(
+    // FAN_CLASS_CONTENT) silently requires CAP_SYS_ADMIN, so this path was
+    // previously untested, not merely untaken). Default is notify-only
+    // (FAN_CLASS_NOTIF), matching this class's pre-Phase-8 behavior.
+    if (enable_blocking) {
+        fanotify_fd_ = fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDWR | O_LARGEFILE);
+        if (fanotify_fd_ >= 0) {
+            permission_capable_ = true;
+        } else {
+            std::cerr << "[Fanotify] FAN_CLASS_CONTENT unavailable (" << std::strerror(errno)
+                      << "), falling back to notify-only mode." << std::endl;
+            fanotify_fd_ = fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, O_RDONLY | O_LARGEFILE);
+            permission_capable_ = false;
+        }
     } else {
-        std::cerr << "[Fanotify] FAN_CLASS_CONTENT unavailable (" << std::strerror(errno)
-                  << "), falling back to notify-only mode." << std::endl;
         fanotify_fd_ = fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, O_RDONLY | O_LARGEFILE);
         permission_capable_ = false;
     }
@@ -45,12 +54,14 @@ bool FanotifyMonitor::Initialize(const std::string& mount_path) {
         return false;
     }
 
-    // Mark the mount point to monitor file modification and write completion,
-    // plus (when permission-capable) FAN_OPEN_PERM for synchronous open blocking.
+    // Mark the mount point to monitor file modification and write completion.
+    // Deliberately notify-only (FAN_MODIFY | FAN_CLOSE_WRITE), never
+    // FAN_OPEN_PERM -- this mount-wide mark must never carry a permission bit,
+    // since that would block every open() on the mount by every process. When
+    // permission_capable_, FAN_OPEN_PERM is added per-path only, via
+    // AddProtectedResource() below, so blocking is scoped to resources this
+    // object was actually asked to protect.
     uint64_t mask = FAN_MODIFY | FAN_CLOSE_WRITE | FAN_EVENT_ON_CHILD;
-    if (permission_capable_) {
-        mask |= FAN_OPEN_PERM;
-    }
     int ret = fanotify_mark(
         fanotify_fd_,
         FAN_MARK_ADD | FAN_MARK_MOUNT,
@@ -69,20 +80,41 @@ bool FanotifyMonitor::Initialize(const std::string& mount_path) {
 
     initialized_ = true;
     std::cout << "[Fanotify] File Integrity Monitor initialized on mount: " << mount_path_
-              << (permission_capable_ ? " (permission-capable, FAN_OPEN_PERM blocking active)" : " (notify-only)")
+              << (permission_capable_ ? " (permission-capable; FAN_OPEN_PERM available per-path via AddProtectedResource)" : " (notify-only)")
               << std::endl;
     return true;
 }
 
-bool FanotifyMonitor::AddProtectedResource(uint64_t dev, uint64_t ino) {
+bool FanotifyMonitor::AddProtectedResource(const std::string& path, uint64_t dev, uint64_t ino) {
     std::lock_guard<std::mutex> lock(protected_resources_mutex_);
     protected_resources_.insert(ResourceId{dev, ino});
+    if (!permission_capable_) {
+        return true; // Tracked for future use; nothing to mark without a permission-capable group.
+    }
+    if (path.empty()) {
+        std::cerr << "[Fanotify] AddProtectedResource: no path given, cannot establish a live "
+                     "FAN_OPEN_PERM mark for (dev=" << dev << ", ino=" << ino << ") -- tracked "
+                     "in-memory only." << std::endl;
+        return true;
+    }
+    // Per-path mark, deliberately NOT FAN_MARK_MOUNT -- only this specific
+    // path's opens block, not the whole mount. See this method's declaration
+    // comment in fanotify.h.
+    int ret = fanotify_mark(fanotify_fd_, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, path.c_str());
+    if (ret < 0) {
+        std::cerr << "[Fanotify] Failed to add FAN_OPEN_PERM mark on " << path
+                  << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
     return true;
 }
 
-bool FanotifyMonitor::RemoveProtectedResource(uint64_t dev, uint64_t ino) {
+bool FanotifyMonitor::RemoveProtectedResource(const std::string& path, uint64_t dev, uint64_t ino) {
     std::lock_guard<std::mutex> lock(protected_resources_mutex_);
     protected_resources_.erase(ResourceId{dev, ino});
+    if (permission_capable_ && !path.empty()) {
+        fanotify_mark(fanotify_fd_, FAN_MARK_REMOVE, FAN_OPEN_PERM, AT_FDCWD, path.c_str());
+    }
     return true;
 }
 

@@ -74,17 +74,25 @@ void TestFanotifyLifecycle() {
     std::cout << "  - FanotifyMonitor lifecycle and event dispatch verified." << std::endl;
 }
 
-// Phase 8 (LINUX_COVERAGE_PLAN.md): belt-and-suspenders blocking test --
-// confirms FAN_OPEN_PERM actually denies access to a registered resource, not
-// just that notification events arrive. Skips gracefully (like
-// TestFanotifyLifecycle above) when fanotify_init fails or FAN_CLASS_CONTENT
-// isn't available -- both require CAP_SYS_ADMIN, same constraint as every
-// other real-kernel test in this suite.
+// Phase 8 (LINUX_COVERAGE_PLAN.md), post-incident revision: belt-and-suspenders
+// blocking test -- confirms FAN_OPEN_PERM actually denies access to a
+// registered resource, not just that notification events arrive. Safe by
+// construction now: Initialize()'s mount-wide mark is notify-only, and
+// AddProtectedResource() below establishes a per-path FAN_MARK_ADD mark (no
+// FAN_MARK_MOUNT) on exactly the two throwaway files this test creates -- an
+// open() on anything else on this machine is never affected, unlike the
+// original version of this test/mechanism, which marked FAN_OPEN_PERM
+// mount-wide on "/home" and took the whole dev machine down the first time it
+// ran as root (see fanotify.h's Initialize() comment for the full incident
+// writeup). Skips gracefully (like TestFanotifyLifecycle above) when
+// fanotify_init fails or FAN_CLASS_CONTENT isn't available -- both require
+// CAP_SYS_ADMIN, same constraint as every other real-kernel test in this
+// suite.
 void TestFanotifyOpenPermBlocking() {
     std::cout << "[TestFanotify] Testing FAN_OPEN_PERM blocking..." << std::endl;
     kinnector::lnx::FanotifyMonitor monitor;
 
-    if (!monitor.Initialize("/home")) {
+    if (!monitor.Initialize("/home", /*enable_blocking=*/true)) {
         std::cout << "  - Note: fanotify_init failed (likely lack of sudo/root permissions). Skipping." << std::endl;
         return;
     }
@@ -111,9 +119,23 @@ void TestFanotifyOpenPermBlocking() {
         monitor.Stop();
         return;
     }
-    monitor.AddProtectedResource(static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino));
+    if (!monitor.AddProtectedResource(protected_path, static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino))) {
+        std::cout << "  - Note: could not establish FAN_OPEN_PERM mark on protected test file, skipping." << std::endl;
+        unlink(protected_path.c_str());
+        unlink(open_path.c_str());
+        monitor.Stop();
+        return;
+    }
 
-    assert(monitor.Start() == true);
+    // NOT assert(monitor.Start() == true) -- this build is -DNDEBUG (Release),
+    // which elides assert()'s entire argument, including the call itself. That
+    // silently skipped Start() here on the first run of this test, meaning no
+    // thread ever read the fanotify queue -- the child processes' open() below
+    // then blocked forever waiting for a permission response nobody was ever
+    // going to send. Real root cause of the incident that led to this comment;
+    // call side-effecting operations outside assert(), always.
+    bool start_ok = monitor.Start();
+    assert(start_ok == true);
     // Give the monitor thread a moment to be actively reading before we attack.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
