@@ -53,6 +53,18 @@ int main(int argc, char** argv) {
     if (fd < 0) {
         return errno; // caller (test_enforcement_e2e) asserts against the exact errno
     }
+    if (flags == O_WRONLY) {
+        // security_file_permission() (where protected_static_inodes and the
+        // resource-owner allowlist are enforced) is invoked from
+        // rw_verify_area() on an actual read/write syscall -- open() alone
+        // with O_WRONLY never reaches it, so a "write deny" probe must
+        // actually attempt a write for that check to run at all.
+        if (write(fd, "x", 1) < 0) {
+            int err = errno;
+            close(fd);
+            return err;
+        }
+    }
     close(fd);
     return 0;
 }

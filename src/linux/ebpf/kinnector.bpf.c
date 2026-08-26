@@ -492,7 +492,7 @@ struct {
 // audit/introspection only (bulk revoke-by-rule happens in userspace, which
 // tracks which CIDRs belong to which rule — LPM_TRIE has no secondary index
 // for that). Checked only from lsm/socket_connect (egress) — socket_listen
-// and socket_post_accept do not enforce (see those hooks' comments below);
+// and socket_accept do not enforce (see those hooks' comments below);
 // real inbound eBPF enforcement would need an XDP/TC program this codebase
 // doesn't have yet, so inbound blocking stays iptables/nftables-only.
 #define FW_ACTION_ALLOW 0
@@ -1755,58 +1755,75 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
         }
     }
 
-    // Detect new login session
-    char parent_comm[16] = {0};
-    int is_login_parent = 0;
+    // Detect an interactive login session. loginuid is stamped once by
+    // pam_loginuid.so at authentication time -- sshd, console login/getty, and
+    // GDM/LightDM/SDDM's PAM stacks all call it (confirmed on this build: see
+    // /etc/pam.d/login, gdm-password, gdm-autologin) -- and stays fixed for the
+    // life of the session across su/sudo/setuid, unlike sniffing the direct
+    // parent process's name (the old approach here only matched "sshd" or
+    // "login" as an immediate parent, so a GUI terminal's shell -- parented by
+    // a window manager/terminal emulator, never sshd/login -- was never
+    // recognized as an admin session at all).
+    //
+    // Critical difference from the old check: loginuid+tty stays true for
+    // EVERY exec for the entire lifetime of the session, not just once at
+    // login. The old "direct parent is sshd/login" condition was structurally
+    // one-shot -- only the login shell itself has sshd/login as its immediate
+    // parent, so only it ever got stamped directly; everything it later ran
+    // inherited the flag exclusively via sched_process_fork's tree_type
+    // propagation. Naively swapping the condition for loginuid+tty broke that
+    // structure: it re-qualifies on every subsequent exec too, so ANY binary
+    // run from an authenticated terminal -- including this test's own
+    // deliberately-untrusted probe processes, and in production literally
+    // anything a user executes -- independently re-earns the bypass. Confirmed
+    // live: without the guard below, 7 of this test's "should be denied"
+    // assertions silently started passing as "allowed" instead.
+    //
+    // Fix: only stamp here when the process's real_parent is itself untracked
+    // (no pid_tree_type_map entry) -- true for a fresh login shell (parent is
+    // sshd/login, or a GUI terminal emulator, neither ever tracked) but false
+    // for anything that shell subsequently runs (parent is the
+    // already-tracked shell itself). This restores the original "stamp once
+    // at the session's entry point, propagate via fork from there" shape
+    // while generalizing the entry-point condition to cover GUI/console
+    // sessions, not just SSH.
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    int has_valid_loginuid = 0;
     if (task) {
-        struct task_struct *real_parent;
-        bpf_probe_read_kernel(&real_parent, sizeof(real_parent), &task->real_parent);
-        if (real_parent) {
-            struct mm_struct *mm = NULL;
-            bpf_probe_read_kernel(&mm, sizeof(mm), &real_parent->mm);
-            if (mm) {
-                struct file *exe_file = NULL;
-                bpf_probe_read_kernel(&exe_file, sizeof(exe_file), &mm->exe_file);
-                if (exe_file) {
-                    struct dentry *dentry = NULL;
-                    bpf_probe_read_kernel(&dentry, sizeof(dentry), &exe_file->f_path.dentry);
-                    if (dentry) {
-                        char name[16] = {0};
-                        bpf_probe_read_kernel_str(name, sizeof(name), &dentry->d_name.name);
-                        if ((name[0] == 's' && name[1] == 's' && name[2] == 'h' && name[3] == 'd' && name[4] == '\0') ||
-                            (name[0] == 'l' && name[1] == 'o' && name[2] == 'g' && name[3] == 'i' && name[4] == 'n' && name[5] == '\0')) {
-                            
-                            struct dentry *parent_dentry = NULL;
-                            bpf_probe_read_kernel(&parent_dentry, sizeof(parent_dentry), &dentry->d_parent);
-                            if (parent_dentry) {
-                                char p_name[16] = {0};
-                                bpf_probe_read_kernel_str(p_name, sizeof(p_name), &parent_dentry->d_name.name);
-                                if ((p_name[0] == 's' && p_name[1] == 'b' && p_name[2] == 'i' && p_name[3] == 'n' && p_name[4] == '\0') ||
-                                    (p_name[0] == 'b' && p_name[1] == 'i' && p_name[2] == 'n' && p_name[3] == '\0')) {
-                                    is_login_parent = 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        uint32_t loginuid = BPF_CORE_READ(task, loginuid.val);
+        if (loginuid != (uint32_t)-1) {
+            has_valid_loginuid = 1;
         }
     }
 
-    if (is_login_parent) {
-        struct signal_struct *signal = NULL;
-        bpf_probe_read_kernel(&signal, sizeof(signal), &task->signal);
-        if (signal) {
-            struct tty_struct *tty = NULL;
-            bpf_probe_read_kernel(&tty, sizeof(tty), &signal->tty);
-            if (tty) {
-                // Yes! This is a login session with a TTY/PTY. Stamp it as TREE_ADMIN_SESSION!
-                uint32_t pid = key.pid;
-                uint32_t flag = TREE_ADMIN_SESSION;
-                bpf_map_update_elem(&pid_tree_type_map, &key, &flag, BPF_ANY);
-                uint8_t allowed = 1;
-                bpf_map_update_elem(&admin_session_pids, &pid, &allowed, BPF_ANY);
+    if (has_valid_loginuid) {
+        struct task_struct *real_parent = NULL;
+        bpf_probe_read_kernel(&real_parent, sizeof(real_parent), &task->real_parent);
+        int parent_already_tracked = 0;
+        if (real_parent) {
+            struct process_key parent_key = {0};
+            bpf_probe_read_kernel(&parent_key.pid, sizeof(parent_key.pid), &real_parent->tgid);
+            bpf_probe_read_kernel(&parent_key.start_time, sizeof(parent_key.start_time), &real_parent->start_time);
+            if (bpf_map_lookup_elem(&pid_tree_type_map, &parent_key)) {
+                parent_already_tracked = 1;
+            }
+        }
+
+        if (!parent_already_tracked) {
+            struct signal_struct *signal = NULL;
+            bpf_probe_read_kernel(&signal, sizeof(signal), &task->signal);
+            if (signal) {
+                struct tty_struct *tty = NULL;
+                bpf_probe_read_kernel(&tty, sizeof(tty), &signal->tty);
+                if (tty) {
+                    // Yes! This is a fresh session's entry point: real login,
+                    // TTY/PTY attached, untracked parent. Stamp it as TREE_ADMIN_SESSION!
+                    uint32_t pid = key.pid;
+                    uint32_t flag = TREE_ADMIN_SESSION;
+                    bpf_map_update_elem(&pid_tree_type_map, &key, &flag, BPF_ANY);
+                    uint8_t allowed = 1;
+                    bpf_map_update_elem(&admin_session_pids, &pid, &allowed, BPF_ANY);
+                }
             }
         }
     }
@@ -2071,7 +2088,16 @@ int BPF_PROG(ptrace_access_check, struct task_struct *child, unsigned int mode) 
     struct process_key key = get_current_process_key();
     uint32_t tracee_pid = BPF_CORE_READ(child, tgid);
     uint32_t tracer_pid = key.pid;
-    struct process_key tracee_key = { tracee_pid, BPF_CORE_READ(child, start_time) };
+    // {0} first, then field-assign -- a positional {a, b} initializer with
+    // every member filled is not guaranteed to zero the padding between
+    // `pid` (4 bytes) and the 8-byte-aligned `start_time`, and BPF hash-map
+    // keys compare the full byte-for-byte struct including that padding.
+    // Garbage padding here made this key never match the one written by
+    // get_current_process_key() (which does start from {0}), so this lookup
+    // silently missed every time regardless of pid/start_time being correct.
+    struct process_key tracee_key = {0};
+    tracee_key.pid = tracee_pid;
+    tracee_key.start_time = BPF_CORE_READ(child, start_time);
 
     // Protect admin session from ptrace attempts by non-admin processes
     uint32_t *tracee_tree = bpf_map_lookup_elem(&pid_tree_type_map, &tracee_key);
@@ -2137,7 +2163,11 @@ int BPF_PROG(task_kill, struct task_struct *p, struct kernel_siginfo *info, int 
 
     uint32_t target_pid = BPF_CORE_READ(p, tgid);
     uint32_t current_pid = bpf_get_current_pid_tgid() >> 32;
-    struct process_key target_key = { target_pid, BPF_CORE_READ(p, start_time) };
+    // See the identical fix/comment on tracee_key in ptrace_access_check --
+    // same uninitialized-padding hash-key-mismatch bug.
+    struct process_key target_key = {0};
+    target_key.pid = target_pid;
+    target_key.start_time = BPF_CORE_READ(p, start_time);
     struct process_key current_key = get_current_process_key();
 
     // Ignore self-signals
@@ -2916,9 +2946,30 @@ int tracepoint_sys_enter_unshare(void *ctx) {
 #define bpf_htons(x) (uint16_t)(((uint16_t)(x) >> 8) | ((uint16_t)(x) << 8))
 #endif
 
-SEC("lsm/socket_post_accept")
-int BPF_PROG(socket_post_accept, struct socket *sock, struct socket *newsock, int flags) {
-    if (!newsock || !newsock->sk) return 0;
+// Fix: this hook was originally written against a "socket_post_accept" LSM
+// hook that does not exist in the kernel's LSM hook set (verified via BTF --
+// no security_socket_post_accept symbol on any checked kernel) and whose
+// 3-arg signature (sock, newsock, flags) doesn't match any real hook either.
+// bpf_object__load() loads all programs in the object atomically, so this one
+// bad definition silently failed the ENTIRE object's load -- every other
+// program in this file, including every real enforcement hook, fell back to
+// degraded tracepoint mode as a result. The real hook for "after an inbound
+// connection is accepted" is security_socket_accept(sock, newsock) -- 2 args,
+// confirmed against kernel BTF. Logic is unchanged: telemetry-only, always
+// returns 0, per this file's own documented inbound-enforcement scope (see
+// the FW_ACTION_* comment above -- inbound blocking stays iptables/nftables,
+// not this hook).
+SEC("lsm/socket_accept")
+int BPF_PROG(socket_accept, struct socket *sock, struct socket *newsock) {
+    if (!newsock) return 0;
+    // Fix: null-check `sk` itself, not a second independent read of
+    // newsock->sk -- the verifier doesn't carry the null-check from the
+    // `newsock->sk` read above across to a *different* read of the same
+    // field, so BPF_CORE_READ(sk, ...)'s internal pointer arithmetic on a
+    // still-"maybe null" sk was rejected: "pointer arithmetic on
+    // trusted_ptr_or_null_ prohibited, null-check it first."
+    struct sock *sk = newsock->sk;
+    if (!sk) return 0;
     uint32_t pid = bpf_get_current_pid_tgid() >> 32;
 
     struct process_key key = get_current_process_key();
@@ -2928,7 +2979,6 @@ int BPF_PROG(socket_post_accept, struct socket *sock, struct socket *newsock, in
     struct TelemetryEvent *event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(struct TelemetryEvent), 0);
     if (event) {
         fill_header(event, 20, SRC_BPF_LSM, pid); // EVT_NETWORK_ACCEPT = 20
-        struct sock *sk = newsock->sk;
         uint16_t family = BPF_CORE_READ(sk, __sk_common.skc_family);
         event->details.details_buffer[0] = 0;
 
@@ -2958,8 +3008,11 @@ int BPF_PROG(socket_post_accept, struct socket *sock, struct socket *newsock, in
 
 SEC("lsm/socket_sendmsg")
 int BPF_PROG(socket_sendmsg, struct socket *sock, struct msghdr *msg, int size) {
-    if (!sock || !sock->sk || !msg) return 0;
+    if (!sock || !msg) return 0;
+    // Fix: same class of bug as socket_accept above -- null-check sk itself,
+    // not a second independent read of sock->sk.
     struct sock *sk = sock->sk;
+    if (!sk) return 0;
     uint16_t family = BPF_CORE_READ(sk, __sk_common.skc_family);
     uint16_t type = BPF_CORE_READ(sock, type);
     if (type != 2) return 0; // SOCK_DGRAM = 2

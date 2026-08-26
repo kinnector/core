@@ -8,6 +8,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <cstddef>
 #include "kinnector/telemetry.h"
 
 // Forward declarations for libbpf types to avoid exposing headers globally
@@ -62,6 +63,20 @@ public:
 
     // Detaches and unloads eBPF programs
     void Stop();
+
+    // DANGEROUS, test-only: Stop() deliberately *disconnects* (rather than
+    // destroys) every pinned LSM/kprobe link so real wardend/antitheft-agent
+    // enforcement survives a daemon restart. That's correct for production,
+    // but it means a root test run (e.g. test_enforcement_e2e) that pins its
+    // own test-fixture policy state to these same system-wide paths leaves
+    // that state enforcing against the *entire live machine* forever, even
+    // after the test process exits -- see linux_coverage_plan_phasing memory
+    // for the sudo/su/pkexec lockout this caused. ForceUnpinAllLinks() fully
+    // unpins and destroys every hook this loader can attach, unconditionally,
+    // so nothing outlives the calling process. Call this ONLY from test
+    // harnesses that just ran with blocking_enabled=1 against real inodes --
+    // never from warden/antitheft-agent's own shutdown path.
+    void ForceUnpinAllLinks();
 
     // Map modification interfaces
     bool UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t start_time, uint32_t value);
@@ -183,6 +198,13 @@ private:
     EventCallback event_callback_;
     TtyEventCallback tty_event_callback_;
 };
+
+// Every path EbpfLoader can pin an LSM/kprobe link to under /sys/fs/bpf/warden.
+// Shared with test harnesses (e.g. test_enforcement_e2e's crash signal handler)
+// so an emergency unlink-everything cleanup can't drift out of sync with what
+// ForceUnpinAllLinks() actually unpins -- see that method's doc comment.
+extern const char* const kWardenPinnedLinkPaths[];
+extern const size_t kWardenPinnedLinkPathsCount;
 
 } // namespace kinnector::lnx
 

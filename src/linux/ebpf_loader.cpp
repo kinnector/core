@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -22,6 +23,26 @@ struct resource_id {
     uint64_t dev;
     uint64_t ino;
 };
+
+// Every caller of the Add*/Remove* functions below obtains `dev` from
+// stat()/fstat()/symlink_metadata() -- glibc's POSIX dev_t encoding (what
+// major()/minor() decode). The kernel's own internal dev_t -- what
+// kinnector.bpf.c reads via inode->i_sb->s_dev, which is what these maps
+// must actually match against at file_open/file_permission time -- uses a
+// completely different bit layout ((major << 20) | minor). These are NOT
+// numerically interchangeable except when major == 0: empirically on this
+// machine, stat()'s raw st_dev for a real filesystem (66306) and the
+// kernel-internal encoding for that identical device (271581186) differ
+// completely. Left unconverted, every (dev, ino) key registered from
+// userspace silently never matches the kernel side, and file_open's
+// "category not found -> allow" default (kinnector.bpf.c's sensitive_inodes_map
+// lookup) means sensitive-file/protected-static-file/owner-allowlist
+// protection is not merely mis-scoped but entirely inert. Convert once, here,
+// at every boundary function -- not in each of the many Rust/C++ callers.
+static inline uint64_t ToKernelDevEncoding(uint64_t posix_dev) {
+    dev_t d = static_cast<dev_t>(posix_dev);
+    return (static_cast<uint64_t>(major(d)) << 20) | static_cast<uint64_t>(minor(d));
+}
 
 // Mirrors kinnector.bpf.c's fw_key4/fw_key6/fw_value exactly (packed,
 // field-for-field) — see that file's Firewall section for the rationale.
@@ -45,6 +66,30 @@ struct fw_value {
 } __attribute__((packed));
 
 namespace kinnector::lnx {
+
+const char* const kWardenPinnedLinkPaths[] = {
+    "/sys/fs/bpf/warden/kprobe_tty_write",
+    "/sys/fs/bpf/warden/kprobe_tty_read",
+    "/sys/fs/bpf/warden/kretprobe_tty_read",
+    "/sys/fs/bpf/warden/file_open",
+    "/sys/fs/bpf/warden/socket_connect",
+    "/sys/fs/bpf/warden/socket_listen",
+    "/sys/fs/bpf/warden/bprm_creds_for_exec",
+    "/sys/fs/bpf/warden/bprm_check_security",
+    "/sys/fs/bpf/warden/ptrace_access_check",
+    "/sys/fs/bpf/warden/file_mprotect",
+    "/sys/fs/bpf/warden/task_kill",
+    "/sys/fs/bpf/warden/path_chmod",
+    "/sys/fs/bpf/warden/mmap_file",
+    "/sys/fs/bpf/warden/tracepoint_sched_process_fork",
+    "/sys/fs/bpf/warden/file_permission",
+    "/sys/fs/bpf/warden/socket_accept",
+    "/sys/fs/bpf/warden/socket_sendmsg",
+    "/sys/fs/bpf/warden/inode_unlink",
+    "/sys/fs/bpf/warden/task_fix_setuid",
+    "/sys/fs/bpf/warden/shm_shmat",
+};
+const size_t kWardenPinnedLinkPathsCount = sizeof(kWardenPinnedLinkPaths) / sizeof(kWardenPinnedLinkPaths[0]);
 
 // Phase 3 (LINUX_COVERAGE_PLAN.md): must match kinnector.bpf.c's
 // resource_owner_hash() exactly, bit-for-bit — this is the userspace side of
@@ -275,6 +320,21 @@ void EbpfLoader::Stop() {
     initialized_ = false;
 }
 
+void EbpfLoader::ForceUnpinAllLinks() {
+    // Unconditional: unlink every known pin path regardless of whether this
+    // process's own bpf_link handle for it is still live. bpf_link__open()
+    // re-derives a handle from the pin itself, so this also cleans up a pin
+    // left behind by a previous crashed/killed process, not just this one's.
+    for (size_t i = 0; i < kWardenPinnedLinkPathsCount; ++i) {
+        const char* path = kWardenPinnedLinkPaths[i];
+        struct bpf_link* link = bpf_link__open(path);
+        if (link) {
+            bpf_link__destroy(link);
+        }
+        unlink(path);
+    }
+}
+
 static void ApplyRamBasedMapScaling(struct bpf_object* bpf_obj) {
     if (!bpf_obj) return;
 
@@ -411,7 +471,7 @@ bool EbpfLoader::LoadAndAttachLsm() {
     AttachOrUpdatePinnedLink(bpf_obj_, "file_permission", "/sys/fs/bpf/warden/file_permission");
 
     // Attach new Dimension 5 telemetry hooks
-    AttachOrUpdatePinnedLink(bpf_obj_, "socket_post_accept", "/sys/fs/bpf/warden/socket_post_accept");
+    AttachOrUpdatePinnedLink(bpf_obj_, "socket_accept", "/sys/fs/bpf/warden/socket_accept");
     AttachOrUpdatePinnedLink(bpf_obj_, "socket_sendmsg", "/sys/fs/bpf/warden/socket_sendmsg");
     AttachOrUpdatePinnedLink(bpf_obj_, "inode_unlink", "/sys/fs/bpf/warden/inode_unlink");
     AttachOrUpdatePinnedLink(bpf_obj_, "task_fix_setuid", "/sys/fs/bpf/warden/task_fix_setuid");
@@ -599,7 +659,7 @@ bool EbpfLoader::AddSensitiveInode(uint64_t dev, uint64_t inode, uint32_t catego
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "sensitive_inodes_map");
     if (!map) return false;
 
-    struct resource_id key = { dev, inode };
+    struct resource_id key = { ToKernelDevEncoding(dev), inode };
     return bpf_map_update_elem(bpf_map__fd(map), &key, &category, BPF_ANY) == 0;
 }
 
@@ -612,7 +672,7 @@ bool EbpfLoader::AddProtectedStaticInode(uint64_t dev, uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "protected_static_inodes");
     if (!map) return false;
 
-    struct resource_id key = { dev, inode };
+    struct resource_id key = { ToKernelDevEncoding(dev), inode };
     uint8_t val = 1;
     return bpf_map_update_elem(bpf_map__fd(map), &key, &val, BPF_ANY) == 0;
 }
@@ -626,7 +686,7 @@ bool EbpfLoader::RemoveProtectedStaticInode(uint64_t dev, uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "protected_static_inodes");
     if (!map) return false;
 
-    struct resource_id key = { dev, inode };
+    struct resource_id key = { ToKernelDevEncoding(dev), inode };
     return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
 }
 
@@ -677,7 +737,7 @@ bool EbpfLoader::AddBypassedDirectoryInode(uint64_t dev, uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "bypassed_directories");
     if (!map) return false;
 
-    struct resource_id key = { dev, inode };
+    struct resource_id key = { ToKernelDevEncoding(dev), inode };
     uint8_t val = 1;
     return bpf_map_update_elem(bpf_map__fd(map), &key, &val, BPF_ANY) == 0;
 }
@@ -691,7 +751,7 @@ bool EbpfLoader::RemoveBypassedDirectoryInode(uint64_t dev, uint64_t inode) {
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, "bypassed_directories");
     if (!map) return false;
 
-    struct resource_id key = { dev, inode };
+    struct resource_id key = { ToKernelDevEncoding(dev), inode };
     return bpf_map_delete_elem(bpf_map__fd(map), &key) == 0;
 }
 
@@ -705,7 +765,7 @@ bool EbpfLoader::AddResourceOwner(uint64_t resource_dev, uint64_t resource_inode
     if (!map) return false;
 
     int fd = bpf_map__fd(map);
-    struct resource_id key = { resource_dev, resource_inode };
+    struct resource_id key = { ToKernelDevEncoding(resource_dev), resource_inode };
     uint64_t bit = 1ULL << ResourceOwnerHash(owner_exec_inode);
     uint64_t existing_mask = 0;
     bpf_map_lookup_elem(fd, &key, &existing_mask); // 0 on miss — fine, OR still correct
@@ -723,7 +783,7 @@ bool EbpfLoader::RemoveResourceOwner(uint64_t resource_dev, uint64_t resource_in
     if (!map) return false;
 
     int fd = bpf_map__fd(map);
-    struct resource_id key = { resource_dev, resource_inode };
+    struct resource_id key = { ToKernelDevEncoding(resource_dev), resource_inode };
     uint64_t existing_mask = 0;
     if (bpf_map_lookup_elem(fd, &key, &existing_mask) != 0) {
         return true; // Nothing to remove.
@@ -844,8 +904,6 @@ void EbpfLoader::RingBufferPollLoop() {
 
 int EbpfLoader::HandleRingBufferEvent(void *ctx, void *data, size_t data_sz) {
     auto* loader = static_cast<EbpfLoader*>(ctx);
-    std::cout << "[EbpfLoader] Received event from ring buffer. Size: " << data_sz 
-              << ", Expected: " << sizeof(TelemetryEvent) << std::endl;
     if (loader->event_callback_ && data && data_sz == sizeof(TelemetryEvent)) {
         loader->event_callback_(*static_cast<TelemetryEvent*>(data));
     }
@@ -854,8 +912,6 @@ int EbpfLoader::HandleRingBufferEvent(void *ctx, void *data, size_t data_sz) {
 
 int EbpfLoader::HandleTtyRingBufferEvent(void *ctx, void *data, size_t data_sz) {
     auto* loader = static_cast<EbpfLoader*>(ctx);
-    std::cout << "[EbpfLoader] Received TTY event from ring buffer. Size: " << data_sz 
-              << ", Expected: " << sizeof(TtyEvent) << std::endl;
     if (loader->tty_event_callback_ && data && data_sz == sizeof(TtyEvent)) {
         loader->tty_event_callback_(*static_cast<TtyEvent*>(data));
     }

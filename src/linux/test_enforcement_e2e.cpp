@@ -22,6 +22,7 @@
 #include "ebpf_loader.h"
 #include <iostream>
 #include <string>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -48,6 +49,31 @@ constexpr uint32_t kModeAntitheft = 2;         // kinnector.bpf.c: MODE_ANTITHEF
 // so the deny tests below can't flake on an accidental hash collision.
 uint32_t ResourceOwnerHash(uint64_t exec_ino) {
     return static_cast<uint32_t>((exec_ino * 2654435761ULL) & 0x3FULL);
+}
+
+// Safety net for the sudo/su/pkexec lockout in linux_coverage_plan_phasing
+// memory: this test runs as root with blocking_enabled=1 against real system
+// paths (kWardenPinnedLinkPaths), and EbpfLoader::Stop() deliberately leaves
+// those pins alive (correct for production, catastrophic for a test that
+// crashes mid-run without reaching its own cleanup). unlink() is
+// async-signal-safe, so a crash still drops every pin's last reference before
+// the process dies -- do NOT call bpf_link__destroy()/anything from libbpf
+// here, it is not guaranteed signal-safe.
+extern "C" void ForceUnpinOnCrash(int sig) {
+    for (size_t i = 0; i < kinnector::lnx::kWardenPinnedLinkPathsCount; ++i) {
+        unlink(kinnector::lnx::kWardenPinnedLinkPaths[i]);
+    }
+    _exit(128 + sig);
+}
+
+void InstallCrashUnpinHandler() {
+    struct sigaction sa{};
+    sa.sa_handler = ForceUnpinOnCrash;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    for (int sig : {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGTERM, SIGINT}) {
+        sigaction(sig, &sa, nullptr);
+    }
 }
 
 const char* ProbePath() {
@@ -271,6 +297,24 @@ bool MakeTempFile(std::string& path_out, uint64_t& inode_out, uint64_t& dev_out)
 
 int g_failures = 0;
 
+// EbpfLoader has no removal API for sensitive_inodes_map/resource_owner_map
+// (Add-only -- see AddSensitiveInode/AddResourceOwner), and every test below
+// registers its temp file's (dev, ino) into one of those maps before
+// unlink()ing it. Freeing the inode immediately let the filesystem recycle
+// that exact inode number for a LATER test's fresh MakeTempFile() call within
+// the same run, which then collided with the earlier, still-live-in-the-map
+// registration -- causing spurious EACCES on completely unrelated files
+// (including this harness's own mkstemp() calls). Deferring every cleanup to
+// process exit keeps every inode this run has ever used alive (never freed,
+// never recyclable) for the run's whole lifetime, eliminating the collision
+// outright rather than just making it less likely.
+std::vector<std::string> g_deferred_unlinks;
+void DeferUnlink(const std::string& path) { g_deferred_unlinks.push_back(path); }
+void RunDeferredUnlinks() {
+    for (const auto& p : g_deferred_unlinks) unlink(p.c_str());
+    g_deferred_unlinks.clear();
+}
+
 void Check(bool cond, const std::string& msg) {
     if (cond) {
         std::cout << "  - PASS: " << msg << std::endl;
@@ -294,7 +338,7 @@ void TestSensitiveInodeReadDeny(EbpfLoader& loader) {
     if (!loader.AddSensitiveInode(dev, ino, /*category=*/1)) { Check(false, "AddSensitiveInode failed"); unlink(path.c_str()); return; }
 
     int rc = RunProbe("open_read", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == EACCES, "open() denied with EACCES (got " + std::to_string(rc) + ")");
 }
 
@@ -312,7 +356,7 @@ void TestProtectedStaticInodeWriteDeny(EbpfLoader& loader) {
     if (!loader.AddProtectedStaticInode(dev, ino)) { Check(false, "AddProtectedStaticInode failed"); unlink(path.c_str()); return; }
 
     int rc = RunProbe("open_write", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == EACCES, "write-open denied with EACCES (got " + std::to_string(rc) + ")");
 }
 
@@ -340,7 +384,7 @@ void TestSensitiveInodeReadAllowForClassifiedProcess(EbpfLoader& loader) {
     }
 
     int rc = RunProbe("open_read", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == 0, "open() succeeded (got " + std::to_string(rc) + ")");
 }
 
@@ -368,7 +412,7 @@ void TestResourceOwnerMapIgnoredInWardenMode(EbpfLoader& loader, uint64_t probe_
     // Probe is not in the owner list -- if resource_owner_map were consulted,
     // this would be denied. It must succeed under MODE_WARDEN regardless.
     int rc = RunProbe("open_read", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == 0, "open() succeeded under MODE_WARDEN despite a denying owner list (got " + std::to_string(rc) + ")");
 }
 
@@ -393,7 +437,7 @@ void TestResourceOwnerAllowlistDenyUnrelatedProcess(EbpfLoader& loader, uint64_t
     if (!loader.AddResourceOwner(dev, ino, fake_owner)) { Check(false, "AddResourceOwner failed"); unlink(path.c_str()); return; }
 
     int rc = RunProbe("open_read", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == EACCES, "open() denied with EACCES for a non-owner (got " + std::to_string(rc) + ")");
 }
 
@@ -413,7 +457,7 @@ void TestResourceOwnerAllowlistAllowConfiguredOwner(EbpfLoader& loader, uint64_t
     if (!loader.AddResourceOwner(dev, ino, probe_ino)) { Check(false, "AddResourceOwner(probe_ino) failed"); unlink(path.c_str()); return; }
 
     int rc = RunProbe("open_read", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == 0, "open() succeeded for a configured owner (got " + std::to_string(rc) + ")");
 }
 
@@ -429,7 +473,7 @@ void TestResourceOwnerAllowlistWriteDeny(EbpfLoader& loader, uint64_t probe_ino)
     if (!loader.AddResourceOwner(dev, ino, fake_owner)) { Check(false, "AddResourceOwner failed"); unlink(path.c_str()); return; }
 
     int rc = RunProbe("open_write", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == EACCES, "write-open denied with EACCES for a non-owner (got " + std::to_string(rc) + ")");
 }
 
@@ -458,7 +502,7 @@ void TestInstallBinaryMapConfigDrivenDetection(EbpfLoader& loader, uint64_t prob
     if (!loader.AddSensitiveInode(dev, ino, /*category=*/1)) { Check(false, "AddSensitiveInode failed"); unlink(path.c_str()); return; }
 
     int rc = RunProbe("open_read", path);
-    unlink(path.c_str());
+    DeferUnlink(path);
     Check(rc == EACCES, "open() denied with EACCES via config-only install-context marking (got " + std::to_string(rc) + ")");
 }
 
@@ -484,7 +528,7 @@ void TestPidReuseInstallContextNotInherited(EbpfLoader& loader) {
     uint64_t decoy_ino, decoy_dev;
     if (!MakeTempFile(decoy_path, decoy_ino, decoy_dev)) { Check(false, "could not create decoy resource for G1"); return; }
     int g1_rc = RunProbeInFreshPidNs(ProbePath(), "open_read", decoy_path);
-    unlink(decoy_path.c_str());
+    DeferUnlink(decoy_path);
     if (g1_rc != 0) {
         // probe_ino is already threshold=2 (verified) by this point in the
         // suite and the decoy file isn't sensitive, so G1's own open() should
@@ -519,8 +563,8 @@ void TestPidReuseInstallContextNotInherited(EbpfLoader& loader) {
     }
 
     int g2_rc = RunProbeInFreshPidNs(probe_copy_path.c_str(), "open_read", target_path);
-    unlink(probe_copy_path.c_str());
-    unlink(target_path.c_str());
+    DeferUnlink(probe_copy_path);
+    DeferUnlink(target_path);
     Check(g2_rc == 0, "G2 (unrelated, also observed as pid=1) not denied by G1's install-context marker (got " + std::to_string(g2_rc) + ")");
 }
 
@@ -594,6 +638,22 @@ int main() {
         std::cerr << "Failed to start EbpfLoader" << std::endl;
         return 1;
     }
+
+    // From here on, real LSM links may get pinned system-wide with this
+    // process's test-fixture policy state -- install the crash-safety net
+    // before doing anything else that could deny exec() to the whole machine.
+    InstallCrashUnpinHandler();
+
+    // Normal (non-crash) shutdown: unlike production Stop() (which
+    // deliberately leaves pins alive for hot-reload), this test must fully
+    // detach everything it attached before exiting -- see ForceUnpinAllLinks()
+    // doc comment and linux_coverage_plan_phasing memory for why.
+    auto SafeShutdown = [&]() {
+        loader.SetConfigValue(kConfigBlockingEnabled, 0);
+        loader.ForceUnpinAllLinks();
+        loader.Stop();
+    };
+
     if (loader.IsMockMode() || !loader.IsLsmActive()) {
         std::cerr << "test_enforcement_e2e requires real BPF LSM enforcement -- the kernel must list "
                      "\"bpf\" in /sys/kernel/security/lsm (a boot-cmdline lsm= setting, not something "
@@ -601,13 +661,13 @@ int main() {
                      "mode cannot satisfy it: this is the one target in the suite meant to assert actual "
                      "kernel-level deny behavior, so it fails loudly here rather than skipping quietly."
                   << std::endl;
-        loader.Stop();
+        SafeShutdown();
         return 1;
     }
 
     if (!loader.SetConfigValue(kConfigBlockingEnabled, 1)) {
         std::cerr << "Failed to enable blocking_enabled" << std::endl;
-        loader.Stop();
+        SafeShutdown();
         return 1;
     }
 
@@ -647,7 +707,8 @@ int main() {
         TestProtectedOwnerKillAllowedUnderWarden(loader, probe_ino);
     }
 
-    loader.Stop();
+    RunDeferredUnlinks();
+    SafeShutdown();
 
     if (g_failures > 0) {
         std::cerr << "\n>>> ENFORCEMENT E2E TEST FAILED (" << g_failures << " check(s)) <<<\n";
