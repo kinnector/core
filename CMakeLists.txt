@@ -36,6 +36,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
         src/windows/driver_helper.cpp
         src/windows/clipboard_helper.cpp
         src/windows/windows_ipc.cpp
+        src/windows/resource_identity.cpp
+        src/windows/authenticode.cpp
+        src/windows/process_integrity.cpp
     )
     add_compile_definitions(TARGET_OS_WINDOWS)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -52,11 +55,28 @@ endif()
 
 add_library(kinnector-core STATIC ${CORE_SOURCES})
 set_target_properties(kinnector-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    # On Windows, kinnector-core-shared's import library and this static
+    # archive would otherwise both resolve to lib/kinnector-core.lib and
+    # silently clobber each other in a full build (whichever target links
+    # second wins) - executables linked against the static target after that
+    # get the DLL's near-empty import stub instead, failing on any internal
+    # C++ symbol that isn't __declspec(dllexport)'d. Give the static output a
+    # distinct name; the CMake target name (what target_link_libraries uses)
+    # is unaffected. Linux/macOS don't collide here (.a vs .so).
+    set_target_properties(kinnector-core PROPERTIES OUTPUT_NAME kinnector-core-static)
+endif()
 
 add_library(kinnector-core-shared SHARED ${CORE_SOURCES})
-set_target_properties(kinnector-core-shared PROPERTIES 
+set_target_properties(kinnector-core-shared PROPERTIES
     OUTPUT_NAME kinnector-core
     POSITION_INDEPENDENT_CODE ON
+    # ffi.h gates KINNECTOR_API dllexport/dllimport on kinnector_core_EXPORTS
+    # specifically. CMake only auto-defines <target>_EXPORTS from the actual
+    # target name (kinnector_core_shared_EXPORTS here), which never matches -
+    # so without this, the DLL build never actually dllexports anything and
+    # every FFI function silently falls through to the dllimport branch.
+    DEFINE_SYMBOL kinnector_core_EXPORTS
 )
 
 target_include_directories(kinnector-core PUBLIC include)
@@ -72,9 +92,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(kinnector-core-shared PRIVATE ${LIBBPF_LIBRARIES} pthread)
     target_include_directories(kinnector-core-shared PRIVATE ${LIBBPF_INCLUDE_DIRS})
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    # Link libraries for Windows ETW and IPC
-    target_link_libraries(kinnector-core PRIVATE advapi32 ole32 tdh)
-    target_link_libraries(kinnector-core-shared PRIVATE advapi32 ole32 tdh)
+    # Link libraries for Windows ETW, IPC, and Authenticode verification
+    # (wintrust/crypt32: WinVerifyTrust/CertGetNameStringA in etw_consumer.cpp)
+    target_link_libraries(kinnector-core PRIVATE advapi32 ole32 tdh wintrust crypt32)
+    target_link_libraries(kinnector-core-shared PRIVATE advapi32 ole32 tdh wintrust crypt32)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     # Link frameworks for macOS
     target_link_libraries(kinnector-core PRIVATE
@@ -166,7 +187,64 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     add_executable(kinnector-runner src/windows/runner.cpp)
-    target_link_libraries(kinnector-runner PRIVATE kinnector-core)
+    # Links against the shared target deliberately: ffi.h's KINNECTOR_API
+    # resolves to __declspec(dllimport) for any consumer that isn't building
+    # kinnector_core_EXPORTS itself, which only kinnector-core-shared's import
+    # library can satisfy - linking the static kinnector-core target here
+    # leaves __imp_* FFI symbols unresolved (see the DEFINE_SYMBOL comment
+    # above kinnector-core-shared).
+    target_link_libraries(kinnector-runner PRIVATE kinnector-core-shared)
+
+    add_executable(kinnector-test-clipboard-helper src/windows/test_clipboard_helper.cpp)
+    target_link_libraries(kinnector-test-clipboard-helper PRIVATE kinnector-core)
+    add_test(NAME test_clipboard_helper COMMAND kinnector-test-clipboard-helper)
+
+    add_executable(kinnector-test-process-lineage src/windows/test_process_lineage.cpp)
+    target_link_libraries(kinnector-test-process-lineage PRIVATE kinnector-core)
+    add_test(NAME test_process_lineage COMMAND kinnector-test-process-lineage)
+    # Needs real Administrator elevation to start a Kernel-Process ETW trace;
+    # the test detects this itself and exits 127 rather than silently passing
+    # or silently mock-falling-back (see core/CLAUDE.md's warning about that
+    # anti-pattern on Linux's test_lsm/test_enforcement_e2e).
+    set_tests_properties(test_process_lineage PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-file-events src/windows/test_file_events.cpp)
+    target_link_libraries(kinnector-test-file-events PRIVATE kinnector-core)
+    add_test(NAME test_file_events COMMAND kinnector-test-file-events)
+    # Same elevation requirement/skip-not-mock pattern as test_process_lineage.
+    set_tests_properties(test_file_events PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-registry-events src/windows/test_registry_events.cpp)
+    target_link_libraries(kinnector-test-registry-events PRIVATE kinnector-core)
+    add_test(NAME test_registry_events COMMAND kinnector-test-registry-events)
+    set_tests_properties(test_registry_events PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-network-events src/windows/test_network_events.cpp)
+    target_link_libraries(kinnector-test-network-events PRIVATE kinnector-core ws2_32)
+    add_test(NAME test_network_events COMMAND kinnector-test-network-events)
+    set_tests_properties(test_network_events PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-taskscheduler-events src/windows/test_taskscheduler_events.cpp)
+    target_link_libraries(kinnector-test-taskscheduler-events PRIVATE kinnector-core)
+    add_test(NAME test_taskscheduler_events COMMAND kinnector-test-taskscheduler-events)
+    set_tests_properties(test_taskscheduler_events PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-resource-identity src/windows/test_resource_identity.cpp)
+    target_link_libraries(kinnector-test-resource-identity PRIVATE kinnector-core)
+    add_test(NAME test_resource_identity COMMAND kinnector-test-resource-identity)
+    # No elevation needed - CreateHardLinkW and GetFileInformationByHandle
+    # both work from a plain user session, unlike the ETW-based tests above.
+
+    add_executable(kinnector-test-process-integrity src/windows/test_process_integrity.cpp)
+    target_link_libraries(kinnector-test-process-integrity PRIVATE kinnector-core)
+    add_test(NAME test_process_integrity COMMAND kinnector-test-process-integrity)
+    # No elevation needed - pure in-memory store, no real ETW/injection detection involved yet.
+
+    add_executable(kinnector-test-dpapi-events src/windows/test_dpapi_events.cpp)
+    target_link_libraries(kinnector-test-dpapi-events PRIVATE kinnector-core crypt32)
+    add_test(NAME test_dpapi_events COMMAND kinnector-test-dpapi-events)
+    # Same elevation requirement/skip-not-mock pattern as test_process_lineage.
+    set_tests_properties(test_dpapi_events PROPERTIES SKIP_RETURN_CODE 127)
 endif()
 
 

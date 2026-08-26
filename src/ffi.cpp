@@ -97,15 +97,33 @@ static std::unique_ptr<kinnector::lnx::FanotifyMonitor> g_fanotify = nullptr;
 #elif defined(TARGET_OS_WINDOWS)
 #include "windows/etw_consumer.h"
 #include "windows/driver_helper.h"
+#include "windows/clipboard_helper.h"
+#include "windows/resource_identity.h"
+#include "windows/process_integrity.h"
 #include <windows.h>
 static std::unique_ptr<kinnector::windows::EtwConsumer> g_etw = nullptr;
 static std::unique_ptr<kinnector::windows::DriverHelper> g_driver = nullptr;
-static HANDLE g_clipboard_process = NULL;
+static std::unique_ptr<kinnector::windows::ClipboardHelper> g_clipboard = nullptr;
+static std::unique_ptr<kinnector::windows::ProtectedResourceStore> g_resource_store = nullptr;
+static std::unique_ptr<kinnector::windows::ProcessIntegrityStore> g_process_integrity = nullptr;
 #endif
 
 static std::mutex g_ffi_mutex;
 static bool g_initialized = false;
 static bool g_running = false;
+
+#if defined(TARGET_OS_WINDOWS)
+// Not part of the C API surface (has C++ linkage, returns std::wstring) -
+// deliberately kept outside extern "C" below.
+static std::wstring Utf8ToWstrFfi(const char* utf8) {
+    if (!utf8 || !utf8[0]) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring result(static_cast<size_t>(n) - 1, L'\0');  // n includes the null terminator
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, result.data(), n);
+    return result;
+}
+#endif
 
 extern "C" {
 
@@ -155,6 +173,16 @@ bool initialize_telemetry_engine(const char* bpf_obj_path, const char* socket_pa
         std::cerr << "[FFI] Warning: Driver Helper failed to initialize. Operating in ETW mode only." << std::endl;
         g_driver.reset();
     }
+
+    g_clipboard = std::make_unique<kinnector::windows::ClipboardHelper>();
+    if (!g_clipboard || !g_clipboard->Initialize()) {
+        std::cerr << "[FFI] Warning: Clipboard Helper failed to initialize. Continuing without clipboard telemetry." << std::endl;
+        g_clipboard.reset();
+    }
+
+    // Pure in-memory map, no external dependency to fail against.
+    g_resource_store = std::make_unique<kinnector::windows::ProtectedResourceStore>();
+    g_process_integrity = std::make_unique<kinnector::windows::ProcessIntegrityStore>();
 #endif
 
     g_initialized = true;
@@ -224,6 +252,17 @@ bool start_telemetry_engine() {
             std::cerr << "[FFI] Warning: Failed to start Driver Helper" << std::endl;
         }
     }
+
+    if (g_clipboard) {
+        g_clipboard->SetEventCallback([](const TelemetryEvent& event) {
+            if (g_sender) {
+                g_sender->SendEvent(event);
+            }
+        });
+        if (!g_clipboard->Start()) {
+            std::cerr << "[FFI] Warning: Failed to start Clipboard Helper" << std::endl;
+        }
+    }
 #endif
 
     g_running = true;
@@ -251,6 +290,9 @@ void stop_telemetry_engine() {
     }
     if (g_driver) {
         g_driver->Stop();
+    }
+    if (g_clipboard) {
+        g_clipboard->Stop();
     }
 #endif
 
@@ -460,6 +502,121 @@ int64_t count_firewall_entries() {
     }
 #endif
     return -1;
+}
+
+bool add_protected_resource_windows(uint32_t volume_serial, uint64_t file_reference_number, uint32_t category) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running) {
+        return g_resource_store->AddProtectedResource(volume_serial, file_reference_number, category);
+    }
+#endif
+    return false;
+}
+
+bool remove_protected_resource_windows(uint32_t volume_serial, uint64_t file_reference_number) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running) {
+        return g_resource_store->RemoveProtectedResource(volume_serial, file_reference_number);
+    }
+#endif
+    return false;
+}
+
+bool is_protected_resource_windows(uint32_t volume_serial, uint64_t file_reference_number, uint32_t* out_category) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running) {
+        return g_resource_store->LookupProtectedResource(volume_serial, file_reference_number, out_category);
+    }
+#endif
+    return false;
+}
+
+bool add_resource_owner_signer_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* signer_subject) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running && signer_subject) {
+        return g_resource_store->AddResourceOwnerSigner(volume_serial, file_reference_number, signer_subject);
+    }
+#endif
+    return false;
+}
+
+bool remove_resource_owner_signer_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* signer_subject) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running && signer_subject) {
+        return g_resource_store->RemoveResourceOwnerSigner(volume_serial, file_reference_number, signer_subject);
+    }
+#endif
+    return false;
+}
+
+bool is_authorized_signer_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* signer_subject) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running && signer_subject) {
+        return g_resource_store->IsAuthorizedSigner(volume_serial, file_reference_number, signer_subject);
+    }
+#endif
+    return false;
+}
+
+bool is_authorized_modifying_path_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* modifying_binary_path) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_running && modifying_binary_path) {
+        return g_resource_store->IsAuthorizedModifyingPath(volume_serial, file_reference_number,
+                                                             Utf8ToWstrFfi(modifying_binary_path));
+    }
+#endif
+    return false;
+}
+
+bool flag_process_injected_windows(uint32_t pid, uint64_t create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_process_integrity && g_running) {
+        return g_process_integrity->FlagProcessInjected(pid, create_time);
+    }
+#endif
+    return false;
+}
+
+bool clear_process_flag_windows(uint32_t pid, uint64_t create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_process_integrity && g_running) {
+        return g_process_integrity->ClearProcessFlag(pid, create_time);
+    }
+#endif
+    return false;
+}
+
+bool is_process_clear_windows(uint32_t pid, uint64_t create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_process_integrity && g_running) {
+        return g_process_integrity->IsProcessClear(pid, create_time);
+    }
+#endif
+    return false;
+}
+
+bool is_authorized_self_update_windows(uint32_t volume_serial, uint64_t file_reference_number,
+                                        const char* modifying_binary_path,
+                                        uint32_t modifying_pid, uint64_t modifying_process_create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_resource_store && g_process_integrity && g_running && modifying_binary_path) {
+        return kinnector::windows::IsAuthorizedSelfUpdate(
+            *g_resource_store, *g_process_integrity, volume_serial, file_reference_number,
+            Utf8ToWstrFfi(modifying_binary_path), modifying_pid, modifying_process_create_time);
+    }
+#endif
+    return false;
 }
 
 bool send_telemetry_event(const TelemetryEvent* event) {

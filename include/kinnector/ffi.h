@@ -80,6 +80,59 @@ KINNECTOR_API bool add_firewall_cidr(bool is_v6, const uint8_t* addr, uint32_t p
 KINNECTOR_API bool remove_firewall_cidr(bool is_v6, const uint8_t* addr, uint32_t prefixlen);
 KINNECTOR_API int64_t count_firewall_entries();
 
+// Windows-only: register/remove/query a protected-resource identity, keyed
+// on the canonical (volume_serial, file_reference_number) pair from
+// resource_identity.h - not raw dev/inode, Windows has no equivalent.
+// Populated by the calling agent (antitheftd) after it loads/diffs
+// protect-community/configs/antitheft/ itself; core never touches that
+// config, same boundary the Linux setters above use for kinnector-config.
+// See WINDOWS_COVERAGE_PLAN.md Phase 5. No-op (returns false) on
+// non-Windows builds.
+KINNECTOR_API bool add_protected_resource_windows(uint32_t volume_serial, uint64_t file_reference_number, uint32_t category);
+KINNECTOR_API bool remove_protected_resource_windows(uint32_t volume_serial, uint64_t file_reference_number);
+KINNECTOR_API bool is_protected_resource_windows(uint32_t volume_serial, uint64_t file_reference_number, uint32_t* out_category);
+
+// Windows-only: owner-allowlist entries for a protected resource, keyed on
+// an Authenticode leaf-signer display-name subject (antitheft.md §4's
+// identity_pin) rather than a specific binary path/hash - this is what lets
+// a vendor's auto-updater keep working across binary-content-changing
+// updates: any binary signed by an allowlisted vendor is authorized,
+// not one pinned image. signer_subject is a UTF-8 C string, matching what
+// TelemetryEvent::ImageLoadDetails::signer_subject already carries.
+KINNECTOR_API bool add_resource_owner_signer_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* signer_subject);
+KINNECTOR_API bool remove_resource_owner_signer_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* signer_subject);
+KINNECTOR_API bool is_authorized_signer_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* signer_subject);
+
+// Convenience: resolves modifying_binary_path's own live Authenticode
+// signer and checks it against the resource's owner set in one call.
+// modifying_binary_path is UTF-8. Returns false if the binary is
+// unsigned/untrusted, same as any signer not in the allowlist.
+KINNECTOR_API bool is_authorized_modifying_path_windows(uint32_t volume_serial, uint64_t file_reference_number, const char* modifying_binary_path);
+
+// Windows-only: process-integrity flags for the self-update trust gate
+// (antitheft.md §3 - trust is a continuously-revocable property of a
+// specific running process instance, not a one-time open-time decision).
+// Composite-keyed on (pid, create_time) - NEVER pid alone, Windows reuses
+// PIDs aggressively; create_time is the process's own creation timestamp
+// (e.g. GetProcessTimes' lpCreationTime as a 64-bit FILETIME value).
+// CURRENTLY A NO-OP PASS-THROUGH: nothing calls flag_process_injected_windows
+// yet, since Phase 4's ETW-TI injection detection is blocked pending real
+// Antimalware-PPL/ELAM certification - is_process_clear_windows always
+// returns true today. See WINDOWS_COVERAGE_PLAN.md / process_integrity.h.
+KINNECTOR_API bool flag_process_injected_windows(uint32_t pid, uint64_t create_time);
+KINNECTOR_API bool clear_process_flag_windows(uint32_t pid, uint64_t create_time);
+KINNECTOR_API bool is_process_clear_windows(uint32_t pid, uint64_t create_time);
+
+// The actual self-update authorization gate: BOTH signed by an allowlisted
+// vendor AND the modifying process instance is currently clear of
+// injection indicators - being signed alone is not sufficient, a
+// legitimately-signed updater binary can still be a hijacked process
+// instance. modifying_binary_path is UTF-8. Inherits the integrity check's
+// current no-op caveat above.
+KINNECTOR_API bool is_authorized_self_update_windows(uint32_t volume_serial, uint64_t file_reference_number,
+                                                      const char* modifying_binary_path,
+                                                      uint32_t modifying_pid, uint64_t modifying_process_create_time);
+
 #ifdef __cplusplus
 }
 #endif

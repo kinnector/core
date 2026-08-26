@@ -6,7 +6,7 @@
 
 // Verify packed struct sizes right at compile time
 static_assert(sizeof(TelemetryHeader) == 22, "TelemetryHeader size must be 22 bytes");
-static_assert(sizeof(TelemetryEvent) == 1566, "TelemetryEvent size must be packed to 1566 bytes");
+static_assert(sizeof(TelemetryEvent) == 1582, "TelemetryEvent size must be packed to 1582 bytes");
 
 void TestHeaderAndEnums() {
     std::cout << "[TestTelemetry] Testing TelemetryHeader alignment and Enum values..." << std::endl;

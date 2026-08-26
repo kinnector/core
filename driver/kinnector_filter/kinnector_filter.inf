@@ -1,0 +1,81 @@
+;;;
+;;; kinnector_filter - Antitheft minifilter, Phase 7 step 1 skeleton
+;;;
+; NOT INSTALLED VIA THIS INF YET for the first toolchain-proof load (a plain
+; `sc create`/`fltmc load` is used instead, see WINDOWS_COVERAGE_PLAN.md
+; Phase 7 notes) - this INF exists so the real install path is established
+; from day one rather than retrofitted later, per Microsoft's own recommended
+; minifilter packaging.
+;
+; ALTITUDE IS A PLACEHOLDER, NOT A REAL ALLOCATION. Microsoft requires
+; requesting a real altitude for the "FSFilter Activity Monitor" load-order
+; group before this ships anywhere beyond this dev machine - an external,
+; non-engineering process (same shape as the ELAM certification and EV
+; code-signing dependencies already tracked in WINDOWS_COVERAGE_PLAN.md
+; Phase 4/Phase 7). Using an unallocated altitude risks colliding with
+; another vendor's real filter - do not deploy this INF as-is outside this
+; dev machine.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ProviderString%
+DriverVer   = 08/26/2026,1.0.0.0
+CatalogFile = kinnector_filter.cat
+
+[DestinationDirs]
+DefaultDestDir          = 12
+MiniFilter.DriverFiles  = 12
+
+[DefaultInstall]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = MiniFilter.DriverFiles
+
+[DefaultInstall.Services]
+AddService  = %ServiceName%,,MiniFilter.Service
+
+[DefaultUninstall]
+DelFiles    = MiniFilter.DriverFiles
+
+[DefaultUninstall.Services]
+DelService  = %ServiceName%,0x200
+
+[MiniFilter.Service]
+DisplayName      = %ServiceName%
+Description      = %ServiceDescription%
+ServiceBinary    = %12%\%DriverName%.sys
+Dependencies     = "FltMgr"
+ServiceType      = 2          ; SERVICE_FILE_SYSTEM_DRIVER
+StartType        = 3          ; SERVICE_DEMAND_START - never auto-starts at boot until explicitly enabled
+ErrorControl     = 1          ; SERVICE_ERROR_NORMAL
+LoadOrderGroup   = "FSFilter Activity Monitor"
+AddReg           = MiniFilter.AddRegistry
+
+[MiniFilter.AddRegistry]
+HKR,,"DebugFlags",0x00010001,0x0
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,0x0
+
+[MiniFilter.DriverFiles]
+%DriverName%.sys
+
+[SourceDisksFiles]
+kinnector_filter.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskId1%,,,
+
+[Strings]
+ProviderString      = "kinnector"
+ServiceDescription  = "Kinnector Antitheft minifilter (Phase 7 skeleton - dev/test only)"
+ServiceName         = "kinnector_filter"
+DriverName          = "kinnector_filter"
+DiskId1             = "kinnector Antitheft Filter Driver Installation Disk"
+DefaultInstance     = "kinnector_filter Instance"
+Instance1.Name      = "kinnector_filter Instance"
+; PLACEHOLDER - see the file-level comment above. Real altitude must come
+; from Microsoft's official Filter Altitude allocation before production use.
+Instance1.Altitude  = "365100"

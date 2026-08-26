@@ -4,3 +4,8 @@ CMakeFiles/
 *.o
 *.a
 *.so
+
+# driver build output
+driver/**/bin/
+driver/**/x64/
+driver/**/*.pfx

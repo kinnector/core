@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7B2E6C36-3F0E-4E2B-9E2C-8C1E4C0B2A0D}</ProjectGuid>
+    <RootNamespace>$(MSBuildProjectName)</RootNamespace>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <ProjectName>kinnector_filter</ProjectName>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>False</UseDebugLibraries>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <!-- Minifilters are WDM-style drivers (raw DriverEntry/DriverUnload
+         entry points using the Filter Manager's own registration API), not
+         KMDF - confirmed no separate minifilter-specific WDK build
+         customization exists on this machine; WindowsDriver.KernelMode.Wdm.props
+         is what actually applies here. -->
+    <DriverType>WDM</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>True</UseDebugLibraries>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <DriverType>WDM</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
+  </PropertyGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" />
+  </ImportGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <IntDir>$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>$(ProjectName)</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <IntDir>$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>$(ProjectName)</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Required since Phase 7 step 4: PsSetCreateProcessNotifyRoutineEx
+           (and Ex2, and the thread/image-load notify equivalents)
+           unconditionally return STATUS_ACCESS_DENIED unless the driver
+           image has IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY set in its PE
+           header - confirmed via Microsoft Learn/community docs after
+           hitting exactly this failure on this machine, not assumed
+           up front. Testsigning mode still satisfies the resulting
+           page-hash verification the same way it already satisfies the
+           plain driver-load signature check - no new certificate needed. -->
+      <AdditionalOptions>/integritycheck %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <!-- Uses the WDK build system's own built-in test-signing step (a
+         separate mechanism from a custom PostBuildEvent) - it auto-manages
+         its own local test certificate, which is the supported VS/WDK
+         workflow for testsigning-mode driver development. Explicit SHA256
+         is required - an empty FileDigestAlgorithm makes the underlying
+         signtool call omit /fd entirely, which current signtool rejects. -->
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Required since Phase 7 step 4: PsSetCreateProcessNotifyRoutineEx
+           (and Ex2, and the thread/image-load notify equivalents)
+           unconditionally return STATUS_ACCESS_DENIED unless the driver
+           image has IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY set in its PE
+           header - confirmed via Microsoft Learn/community docs after
+           hitting exactly this failure on this machine, not assumed
+           up front. Testsigning mode still satisfies the resulting
+           page-hash verification the same way it already satisfies the
+           plain driver-load signature check - no new certificate needed. -->
+      <AdditionalOptions>/integritycheck %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="kinnector_filter.c" />
+    <ClCompile Include="protected_resources.c" />
+    <ClCompile Include="protected_registry_keys.c" />
+    <ClCompile Include="process_lineage.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="protected_resources.h" />
+    <ClInclude Include="protected_registry_keys.h" />
+    <ClInclude Include="process_lineage.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Not built/verified yet - the INF isn't used for this step's install
+         path (a plain `sc create`/`fltmc load`, see WINDOWS_COVERAGE_PLAN.md
+         Phase 7), and this machine's InfVerif.dll is currently broken
+         (DLL load failure, a WDK-10.0.26100.0-vs-10.0.28000.0 tooling issue,
+         not a project/INF content issue). Re-add once real INF-based
+         packaging work begins and the tooling issue is resolved. -->
+    <!-- <Inf Exclude="@(Inf)" Include="*.inf" /> -->
+    <FilesToPackage Include="$(TargetPath)" Condition="'$(ConfigurationType)'=='Driver' or '$(ConfigurationType)'=='DynamicLibrary'" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

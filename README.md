@@ -21,10 +21,10 @@ This separation - enforcement mechanism vs. policy authoring - is deliberate: Co
 | Platform | Status | Mechanism |
 |---|---|---|
 | **Linux** | Full - process, file, network, memory, terminal/SSH, container-boundary coverage, enforcement-capable via BPF LSM | eBPF (kprobes, tracepoints, BPF LSM hooks) + `fanotify` |
-| **Windows** | Partial - telemetry collection only, no kernel-driver enforcement layer yet | Event Tracing for Windows (ETW), kernel providers: `Kernel-Process`, `Kernel-File`, `Kernel-Network` |
+| **Windows** | Partial - telemetry collection only, no kernel-driver enforcement layer yet | Event Tracing for Windows (ETW), kernel providers: `Kernel-Process`, `Kernel-File`, `Kernel-Network`; clipboard monitoring via `AddClipboardFormatListener` |
 | **macOS** | Not yet implemented - design doc only (`src/macos/MACOS_COVERAGE_PLAN.md`), no source | Endpoint Security Framework (ESF) + FSEvents + OpenBSM (planned) |
 
-Linux is the reference implementation and the only backend capable of active enforcement (via BPF LSM return values), not just passive telemetry. Windows currently observes via ETW but its kernel driver integration (`DriverHelper`) is a stub with no enforcement logic. macOS has no code yet - treat it as a roadmap item, not a supported target.
+Linux is the reference implementation and the only backend capable of active enforcement (via BPF LSM return values), not just passive telemetry. Windows currently observes via ETW but its kernel driver integration (`DriverHelper`) is a stub with no enforcement logic - clipboard writes are captured separately (outside ETW, via the Win32 clipboard-listener API) and reported with owner-process attribution, but this is raw collection only, same caveat as the rest of Windows: no in-kernel blocking, and no hijack/tamper detection logic sits on top of it yet. macOS has no code yet - treat it as a roadmap item, not a supported target.
 
 ## Linux: hooks by category
 
@@ -73,7 +73,7 @@ Map capacity for all of the above (process/inode/session-tracking maps) is auto-
 
 25 distinct event types across process lifecycle, filesystem, network, memory, and terminal/SSH activity - process creation/termination with full parent-child lineage, file open/read/write/create/rename/delete, network connect/accept/listen/DNS query, `mprotect`/memory-map changes, `ptrace` attachment, privilege changes, signal delivery, IPC access, clipboard writes, call-stack frames, and decrypted SSH auth/terminal commands. See `include/kinnector/telemetry.h` for the full `EventType` enum and per-event payload structs.
 
-Every event shares a common `TelemetryHeader` (sequence number, nanosecond timestamp, PID, event type, source) followed by a type-specific payload, packed into a fixed 1566-byte `TelemetryEvent` frame - cheap to serialize, cheap to parse, no dynamic allocation on the hot path.
+Every event shares a common `TelemetryHeader` (sequence number, nanosecond timestamp, PID, event type, source) followed by a type-specific payload, packed into a fixed 1582-byte `TelemetryEvent` frame - cheap to serialize, cheap to parse, no dynamic allocation on the hot path.
 
 ## Using it from any FFI-capable language
 
@@ -152,7 +152,7 @@ startEngine();
 
 ### Consuming events: your agent is the socket server, Core is the client
 
-Core doesn't expose a "give me the next event" FFI call - it dials out to a Unix socket your agent listens on, and pushes raw, fixed-size `TelemetryEvent` frames (1566 bytes each, `#pragma pack(1)`, no length prefix needed since the size is constant). If `auth_token` was non-empty at `initialize_telemetry_engine`, Core sends a 4-byte little-endian token length + the token bytes first, and blocks until your server writes back a single status byte (`1` = accepted, anything else = rejected). This is enough to build a full consumer in pure Python with no FFI at all:
+Core doesn't expose a "give me the next event" FFI call - it dials out to a Unix socket your agent listens on, and pushes raw, fixed-size `TelemetryEvent` frames (1582 bytes each, `#pragma pack(1)`, no length prefix needed since the size is constant). If `auth_token` was non-empty at `initialize_telemetry_engine`, Core sends a 4-byte little-endian token length + the token bytes first, and blocks until your server writes back a single status byte (`1` = accepted, anything else = rejected). This is enough to build a full consumer in pure Python with no FFI at all:
 
 ```python
 import socket, struct, os
@@ -161,10 +161,10 @@ SOCK_PATH = "/var/run/kinnector/telemetry.sock"
 EXPECTED_TOKEN = b"your-auth-token"
 
 # TelemetryHeader layout (see include/kinnector/telemetry.h): packed,
-# no padding -> 8+8+4+1+1 = 22 bytes, followed by a 1544-byte event payload.
+# no padding -> 8+8+4+1+1 = 22 bytes, followed by a 1560-byte event payload.
 HEADER_FMT = "<QQIBB"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-EVENT_SIZE = 1566
+EVENT_SIZE = 1582
 
 EVENT_TYPES = {
     1: "ProcessCreate", 2: "ProcessStop", 3: "FileRead", 4: "FileCreate",
@@ -250,7 +250,7 @@ Note: `BpfMapType` is currently an internal enum (`ebpf_loader.h`, not `ffi.h`),
 
 Core is designed to sit on syscall-hot paths system-wide (`file_open`/`file_permission`/`ptrace_access_check` fire on every relevant syscall, on every process, on the host it's loaded on), so the design constraint throughout is: do the minimum possible work in-kernel, and never let userspace latency or allocation stalls sit on the enforcement path.
 
-**Fixed-size, zero-allocation event frames.** Every `TelemetryEvent` is a `#pragma pack(1)` struct, always exactly 1566 bytes, written directly into ring buffer memory and read directly off the socket - no dynamic allocation, no variable-length encoding/decoding, on either side of the IPC boundary.
+**Fixed-size, zero-allocation event frames.** Every `TelemetryEvent` is a `#pragma pack(1)` struct, always exactly 1582 bytes, written directly into ring buffer memory and read directly off the socket - no dynamic allocation, no variable-length encoding/decoding, on either side of the IPC boundary.
 
 **Per-CPU state to avoid cross-core contention.** The event sequence counter (`seq_counter`) and a scratch buffer used to stage large structs before a map write (`scratch_map`) are both `BPF_MAP_TYPE_PERCPU_ARRAY` - each CPU gets its own copy, so no atomic increment or lock is shared across cores on the hot path. The scratch buffer also sidesteps eBPF's ~512-byte verifier stack limit for structs too large to build on the BPF stack directly.
 
