@@ -35,17 +35,20 @@ void TestMockMode() {
         tty_called = true;
     });
 
-    // Test UpdateMapEntry and DeleteMapEntry for every single enum value of BpfMapType
+    // Test UpdateMapEntry and DeleteMapEntry for every BpfMapType value they
+    // actually support -- SensitiveInodes/TrustedExecInodes/ConfigMap/
+    // BypassedDirectories are deliberately NOT in UpdateMapEntry/DeleteMapEntry's
+    // switch (they need a (dev,ino) resource_id or a bare-inode/index key that
+    // this function's (pid, start_time, value) signature can't represent);
+    // they have their own dedicated Add*/Set* functions, exercised separately
+    // below (see AddSensitiveInode/AddTrustedExecInode/SetConfigValue/
+    // AddBypassedDirectoryInode calls further down this test).
     std::vector<kinnector::lnx::BpfMapType> all_maps = {
         kinnector::lnx::BpfMapType::CategoryFlags,
         kinnector::lnx::BpfMapType::PendingNetwork,
         kinnector::lnx::BpfMapType::TrustedRoots,
-        kinnector::lnx::BpfMapType::SensitiveInodes,
         kinnector::lnx::BpfMapType::TaintedProcess,
-        kinnector::lnx::BpfMapType::TrustedExecInodes,
         kinnector::lnx::BpfMapType::ProcessThreshold,
-        kinnector::lnx::BpfMapType::ConfigMap,
-        kinnector::lnx::BpfMapType::BypassedDirectories,
         kinnector::lnx::BpfMapType::PidTreeType,
         kinnector::lnx::BpfMapType::JvmExceptionPids,
         kinnector::lnx::BpfMapType::DbOutboundAllowlist,
@@ -71,7 +74,11 @@ void TestMockMode() {
     assert(loader.AddProtectedStaticInode(1, 10002) == true);
     assert(loader.RemoveProtectedStaticInode(1, 10002) == true);
     assert(loader.AddTrustedExecInode(10003, 5) == true);
-    assert(loader.LookupTrustedExecInode(10003) == false); // In mock mode lookup returns false or check
+    // LookupTrustedExecInode's mock-mode branch deliberately returns true
+    // unconditionally ("treat everything as trusted to avoid false positives"
+    // -- see its own doc comment in ebpf_loader.cpp), regardless of whether
+    // AddTrustedExecInode was ever called; mock mode doesn't persist anything.
+    assert(loader.LookupTrustedExecInode(10003) == true);
     assert(loader.SetConfigValue(0, 100) == true);
     assert(loader.AddBypassedDirectoryInode(1, 10004) == true);
     assert(loader.RemoveBypassedDirectoryInode(1, 10004) == true);
@@ -86,8 +93,8 @@ void TestRealKernelMode() {
     std::cout << "[TestEbpfLoader] Testing Real Kernel Mode (if kinnector.bpf.o exists and sudo)..." << std::endl;
     kinnector::lnx::EbpfLoader loader;
 
-    // We check common build locations for kinnector.bpf.o
-    std::string bpf_path = "build/kinnector.bpf.o";
+    // ctest's working directory for this target is already build/ itself.
+    std::string bpf_path = "kinnector.bpf.o";
     bool init_res = loader.Initialize(bpf_path, false);
     if (!init_res || loader.IsMockMode()) {
         std::cout << "  - Note: Real kernel eBPF program load skipped (IsMockMode=" << loader.IsMockMode() 

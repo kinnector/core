@@ -27,12 +27,21 @@ bool LinuxTelemetrySender::Start(const IPCConfig& config) {
 void LinuxTelemetrySender::Stop() {
     running_ = false;
     connected_ = false;
-    
+
     int fd = socket_fd_.exchange(-1);
     if (fd != -1) {
+        // shutdown() before close(): closing an fd from a different thread
+        // than the one blocked in read()/recv() on it is unspecified by
+        // POSIX and does not reliably wake that thread on Linux -- shutdown()
+        // is the documented, reliable way to force a blocked recv/read on a
+        // socket to return (with 0/EOF) regardless of which thread calls it.
+        // Without this, ConnectionLoop's blocking read() inside
+        // PerformHandshake (waiting for an auth-status byte that may never
+        // arrive) could leave this join() waiting forever.
+        shutdown(fd, SHUT_RDWR);
         close(fd);
     }
-    
+
     if (connection_thread_.joinable()) {
         connection_thread_.join();
     }
@@ -100,12 +109,35 @@ void LinuxTelemetrySender::ConnectionLoop() {
             }
         }
         
+        // Expose fd to Stop() before the (blocking) handshake, not after --
+        // PerformHandshake's read() blocks waiting for an auth-status byte
+        // that may never arrive (e.g. a peer that accepted the connection at
+        // the kernel level but never drives the handshake protocol). Without
+        // this, Stop()'s socket_fd_.exchange(-1) has nothing to close while
+        // we're blocked inside PerformHandshake, so its join() hangs forever.
+        socket_fd_ = fd;
+
         if (PerformHandshake(fd)) {
-            socket_fd_ = fd;
             connected_ = true;
         } else {
             std::cerr << "IPC Handshake failed" << std::endl;
-            close(fd);
+            // Stop() may have concurrently claimed and closed this exact fd
+            // (racing us out of a blocking read/write inside PerformHandshake)
+            // -- only close it ourselves if socket_fd_ still holds our value,
+            // to avoid a double-close.
+            int expected = fd;
+            if (socket_fd_.compare_exchange_strong(expected, -1)) {
+                close(fd);
+            }
+            // Every other failure branch in this loop backs off before
+            // retrying; this one didn't, so a persistent auth failure (e.g.
+            // a bad token) tight-loops connect() attempts against a peer
+            // that never accepts them, exhausting the Unix-domain listen
+            // backlog and blocking this thread inside connect() -- which
+            // Stop() can never interrupt (running_=false can't preempt an
+            // in-flight blocking syscall), hanging Stop()'s join() forever.
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
         }
     }
 }

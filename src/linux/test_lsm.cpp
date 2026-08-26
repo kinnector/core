@@ -11,7 +11,7 @@ int main() {
     std::cout << "=== Loading eBPF LSM Program ===" << std::endl;
     kinnector::lnx::EbpfLoader loader;
     
-    std::string bpf_path = "build/kinnector.bpf.o";
+    std::string bpf_path = "kinnector.bpf.o";
     
     if (!loader.Initialize(bpf_path, false)) {
         std::cerr << "Failed to initialize EbpfLoader" << std::endl;

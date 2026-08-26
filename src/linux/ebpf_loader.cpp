@@ -543,11 +543,10 @@ bool EbpfLoader::LoadAndAttachFallback() {
 }
 
 bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t start_time, uint32_t value) {
-    if (mock_mode_ || !bpf_obj_) {
-        return true;
-    }
-
-    std::lock_guard<std::mutex> lock(map_mutex_);
+    // Validate map_type before the mock-mode short-circuit below -- an invalid
+    // enum value is a caller bug regardless of mode, but mock_mode_'s old
+    // early `return true` skipped this switch entirely, silently treating
+    // garbage map_type values as success in mock mode.
     const char* map_name = nullptr;
     switch (map_type) {
         case BpfMapType::CategoryFlags: map_name = "category_flags_map"; break;
@@ -568,6 +567,11 @@ bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         default: return false;
     }
 
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, map_name);
     if (!map) return false;
 
@@ -603,11 +607,8 @@ bool EbpfLoader::UpdateMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
 }
 
 bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t start_time) {
-    if (mock_mode_ || !bpf_obj_) {
-        return true;
-    }
-
-    std::lock_guard<std::mutex> lock(map_mutex_);
+    // See the identical fix/comment in UpdateMapEntry -- validate map_type
+    // before the mock-mode short-circuit, not after.
     const char* map_name = nullptr;
     switch (map_type) {
         case BpfMapType::CategoryFlags: map_name = "category_flags_map"; break;
@@ -628,6 +629,11 @@ bool EbpfLoader::DeleteMapEntry(BpfMapType map_type, uint32_t pid, uint64_t star
         default: return false;
     }
 
+    if (mock_mode_ || !bpf_obj_) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
     struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj_, map_name);
     if (!map) return false;
 

@@ -66,7 +66,10 @@ void TestFFILifecycleAndAPI() {
     assert(add_bypassed_directory_inode(1, 1003) == true);
     assert(remove_bypassed_directory_inode(1, 1003) == true);
     assert(add_trusted_exec_inode(1004, 5) == true);
-    assert(is_trusted_exec_inode(1004) == false); // Mock mode returns false or lookup status
+    // See the identical LookupTrustedExecInode comment/fix in test_ebpf_loader.cpp --
+    // mock mode deliberately returns true unconditionally ("treat everything as
+    // trusted to avoid false positives").
+    assert(is_trusted_exec_inode(1004) == true);
     assert(set_config_value(0, 42) == true);
     assert(update_process_threshold(5555, 123456ULL, 2) == true);
     assert(update_map_entry(0, 5555, 123456ULL, 1) == true);
