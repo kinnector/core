@@ -148,10 +148,52 @@
 // as unload always reaches that call, which the existing atomic-teardown
 // discipline already guarantees.
 
+// Phase 7 step 9 (this change): raw-volume (\\.\C:) coarse allowlist gate.
+// See raw_volume_gate.h for the full scope note - this covers only the
+// raw-volume half of step 9's plan line item, not \\.\PhysicalDriveN, which
+// needs a separate device-stack attachment this driver doesn't have.
+//
+// Detection: a create whose target FileObject->FileName is empty (zero
+// length) means the caller opened the volume device object itself - e.g.
+// "\\.\C:" - rather than any path within its file system. A normal file or
+// even the root directory ("\\.\C:\") always carries a non-empty FileName
+// at this point; this is the standard, widely-used technique for
+// distinguishing a raw-volume open from an ordinary file create at the
+// minifilter layer. This check runs before the existing per-file
+// FileInternalInformation query, which either doesn't apply to a raw-volume
+// open or isn't reliable for one - untested on this driver either way,
+// since this step wasn't run against a real \\.\C: handle on a live
+// machine (unlike steps 1-4, which each closed with an empirical
+// verification pass - see [[core_windows_phase7_progress]]). Flag this
+// explicitly rather than claim step 3's level of confidence.
+//
+// gRawVolumeEnforcementEnabled follows the exact same doctrine as
+// gRegistryEnforcementEnabled: defaults FALSE, only a test-only registry
+// seed (TestRawVolumeEnforcementEnabled) can flip it, and even when on, an
+// empty allowlist means "nothing configured to check against" - fail open,
+// never deny. A raw-volume open is only ever denied when enforcement is on,
+// the allowlist is non-empty, AND the requesting process's coarse image
+// name isn't in it.
 #include <fltKernel.h>
 #include "protected_resources.h"
 #include "protected_registry_keys.h"
 #include "process_lineage.h"
+#include "raw_volume_gate.h"
+
+// PsGetProcessImageFileName is a real, stable NTOSKRNL export used
+// throughout the driver ecosystem (including major AV/EDR products) for
+// exactly this kind of coarse process identification, but it isn't
+// declared in the public WDK headers this project includes - manual
+// declaration is the standard, widely-documented way every other minifilter
+// sample handles this. See raw_volume_gate.h for why this is deliberately
+// coarse (no path, no signer, ~15 chars, trivially spoofable by process
+// naming) rather than a substitute for Phase 5's real signer-based identity
+// work.
+NTKERNELAPI
+PCHAR
+PsGetProcessImageFileName(
+    _In_ PEPROCESS Process
+    );
 
 DRIVER_INITIALIZE DriverEntry;
 NTSTATUS KinnectorFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags);
@@ -190,6 +232,11 @@ VOID KinnectorRecordTestLineageObservation(
     _In_ HANDLE ChildProcessId,
     _In_ HANDLE ReportedParentProcessId,
     _In_ HANDLE RealCreatorProcessId);
+VOID KinnectorRecordTestRawVolumeObservation(_In_ BOOLEAN Denied);
+
+VOID KinnectorHandleRawVolumeOpen(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ ULONG VolumeSerialNumber);
 
 EX_CALLBACK_FUNCTION KinnectorRegistryCallback;
 
@@ -262,6 +309,11 @@ BOOLEAN gEnforcementEnabled = FALSE;
 // isn't. Defaults off; only KinnectorLoadTestConfiguration's test-only
 // registry seed can flip it, and only for a deliberately-controlled test.
 BOOLEAN gRegistryEnforcementEnabled = FALSE;
+
+// Raw-volume gate equivalent of gRegistryEnforcementEnabled - see this
+// file's step 9 scope note and raw_volume_gate.h for the full doctrine.
+// Defaults off; test-only registry seed only.
+BOOLEAN gRawVolumeEnforcementEnabled = FALSE;
 
 // PLACEHOLDER - registry-callback altitudes are a separate Microsoft-managed
 // numbering space from minifilter altitudes (see core/driver/kinnector_filter/
@@ -393,6 +445,15 @@ KinnectorPostCreate(
 
     status = FltGetInstanceContext(FltObjects->Instance, (PFLT_CONTEXT*)&instanceContext);
     if (!NT_SUCCESS(status)) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    // Step 9: a raw-volume open ("\\.\C:") has no path component at all -
+    // see the file-level scope note above for why this check has to come
+    // before, and instead of, the per-file identity resolution below.
+    if (FltObjects->FileObject->FileName.Length == 0) {
+        KinnectorHandleRawVolumeOpen(Data, instanceContext->VolumeSerialNumber);
+        FltReleaseContext(instanceContext);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -568,6 +629,60 @@ KinnectorLoadTestConfiguration(
         }
     }
 
+    // Fifth optional seed, same \Parameters key: step 9's raw-volume
+    // allowlist entry (REG_SZ, a short ANSI-range image file name e.g.
+    // "chkdsk.exe" - see raw_volume_gate.h for why this is a bare image
+    // name, not a path). Registry REG_SZ values are UTF-16; converted here
+    // with a plain truncating narrow-copy since every real entry is
+    // expected to be pure ASCII (matching PsGetProcessImageFileName's own
+    // ANSI-only output) - not a general Unicode-to-ANSI conversion.
+    {
+        UCHAR allowlistBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + KINNECTOR_IMAGE_NAME_MAX_CHARS * sizeof(WCHAR)];
+        PKEY_VALUE_PARTIAL_INFORMATION allowlistInfo = (PKEY_VALUE_PARTIAL_INFORMATION)allowlistBuffer;
+        CHAR ansiName[KINNECTOR_IMAGE_NAME_MAX_CHARS];
+        ULONG charCount;
+        ULONG j;
+
+        RtlInitUnicodeString(&valueName, L"TestRawVolumeAllowlistImageName");
+        status = ZwQueryValueKey(keyHandle, &valueName, KeyValuePartialInformation, allowlistInfo, sizeof(allowlistBuffer), &resultLength);
+        if (NT_SUCCESS(status) && allowlistInfo->Type == REG_SZ && allowlistInfo->DataLength >= sizeof(WCHAR)) {
+            PWCH chars = (PWCH)allowlistInfo->Data;
+
+            charCount = allowlistInfo->DataLength / sizeof(WCHAR);
+            if (charCount >= KINNECTOR_IMAGE_NAME_MAX_CHARS) {
+                charCount = KINNECTOR_IMAGE_NAME_MAX_CHARS - 1;
+            }
+
+            RtlZeroMemory(ansiName, sizeof(ansiName));
+            for (j = 0; j < charCount && chars[j] != L'\0'; j++) {
+                ansiName[j] = (CHAR)(chars[j] & 0x7F);
+            }
+
+            if (ansiName[0] != '\0') {
+                KinnectorAddRawVolumeAllowlistEntry(ansiName);
+                gTestModeActive = TRUE;
+            }
+        }
+    }
+
+    // Sixth optional seed, same \Parameters key: step 9's
+    // gRawVolumeEnforcementEnabled toggle - same pattern as
+    // TestRegistryEnforcementEnabled above.
+    {
+        UCHAR enforceBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+        PKEY_VALUE_PARTIAL_INFORMATION enforceInfo = (PKEY_VALUE_PARTIAL_INFORMATION)enforceBuffer;
+        ULONG enforceValue = 0;
+
+        RtlInitUnicodeString(&valueName, L"TestRawVolumeEnforcementEnabled");
+        status = ZwQueryValueKey(keyHandle, &valueName, KeyValuePartialInformation, enforceInfo, sizeof(enforceBuffer), &resultLength);
+        if (NT_SUCCESS(status) && enforceInfo->Type == REG_DWORD && enforceInfo->DataLength == sizeof(ULONG)) {
+            RtlCopyMemory(&enforceValue, enforceInfo->Data, sizeof(ULONG));
+            if (enforceValue != 0) {
+                gRawVolumeEnforcementEnabled = TRUE;
+            }
+        }
+    }
+
     ZwClose(keyHandle);
 }
 
@@ -627,6 +742,85 @@ KinnectorRecordTestRegistryObservation(
     RtlInitUnicodeString(&valueName, L"TestObservedRegistryMatch");
     ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &value, sizeof(value));
     ZwClose(keyHandle);
+}
+
+VOID
+KinnectorRecordTestRawVolumeObservation(
+    _In_ BOOLEAN Denied
+    )
+{
+    NTSTATUS status;
+    HANDLE keyHandle = NULL;
+    OBJECT_ATTRIBUTES objAttrs;
+    UNICODE_STRING valueName;
+    ULONG value = 1;
+
+    if (!gTestModeActive) {
+        return;
+    }
+
+    InitializeObjectAttributes(&objAttrs, &gTestParametersPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ZwOpenKey(&keyHandle, KEY_SET_VALUE, &objAttrs);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    RtlInitUnicodeString(&valueName, L"TestRawVolumeObserved");
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &value, sizeof(value));
+
+    if (Denied) {
+        RtlInitUnicodeString(&valueName, L"TestRawVolumeDenied");
+        ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &value, sizeof(value));
+    }
+
+    ZwClose(keyHandle);
+}
+
+VOID
+KinnectorHandleRawVolumeOpen(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ ULONG VolumeSerialNumber
+    )
+{
+    PCHAR imageFileName;
+    BOOLEAN allowlisted = TRUE;
+    BOOLEAN allowlistEmpty;
+    BOOLEAN deny = FALSE;
+
+    // Fail-open: no image name to check against means nothing to deny.
+    // PsGetProcessImageFileName can return NULL for processes with no
+    // image (e.g. System) - never treat that as grounds to block.
+    imageFileName = PsGetProcessImageFileName(PsGetCurrentProcess());
+    if (imageFileName == NULL) {
+        return;
+    }
+
+    allowlistEmpty = KinnectorRawVolumeAllowlistIsEmpty();
+    if (!allowlistEmpty) {
+        allowlisted = KinnectorIsRawVolumeAllowlisted(imageFileName);
+    }
+
+    DbgPrint(
+        "kinnector_filter: raw-volume OPEN observed (vol=0x%08lX image=%s allowlisted=%d enforcement=%d)\n",
+        VolumeSerialNumber,
+        imageFileName,
+        allowlisted,
+        gRawVolumeEnforcementEnabled);
+
+    // Only ever deny when enforcement is on, an allowlist has actually been
+    // configured, AND this specific caller isn't on it - an empty allowlist
+    // is inert, same discipline as every other blocking mechanism in this
+    // driver (see gEnforcementEnabled's file-level note).
+    if (gRawVolumeEnforcementEnabled && !allowlistEmpty && !allowlisted) {
+        deny = TRUE;
+    }
+
+    KinnectorRecordTestRawVolumeObservation(deny);
+
+    if (deny) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+    }
 }
 
 static BOOLEAN
@@ -850,6 +1044,7 @@ DriverEntry(
     KinnectorProtectedResourcesInit();
     KinnectorProtectedRegistryKeysInit();
     KinnectorProcessLineageInit();
+    KinnectorRawVolumeGateInit();
     KinnectorLoadTestConfiguration(RegistryPath);
 
     status = FltRegisterFilter(DriverObject, &FilterRegistration, &gFilterHandle);

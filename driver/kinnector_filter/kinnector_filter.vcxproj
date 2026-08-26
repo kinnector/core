@@ -113,11 +113,13 @@
     <ClCompile Include="protected_resources.c" />
     <ClCompile Include="protected_registry_keys.c" />
     <ClCompile Include="process_lineage.c" />
+    <ClCompile Include="raw_volume_gate.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="protected_resources.h" />
     <ClInclude Include="protected_registry_keys.h" />
     <ClInclude Include="process_lineage.h" />
+    <ClInclude Include="raw_volume_gate.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- Not built/verified yet - the INF isn't used for this step's install
