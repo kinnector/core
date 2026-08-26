@@ -64,7 +64,7 @@
       <WarningLevel>Level4</WarningLevel>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltMgr.lib;ksecdd.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- Required since Phase 7 step 4: PsSetCreateProcessNotifyRoutineEx
            (and Ex2, and the thread/image-load notify equivalents)
            unconditionally return STATUS_ACCESS_DENIED unless the driver
@@ -92,7 +92,7 @@
       <WarningLevel>Level4</WarningLevel>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltMgr.lib;ksecdd.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- Required since Phase 7 step 4: PsSetCreateProcessNotifyRoutineEx
            (and Ex2, and the thread/image-load notify equivalents)
            unconditionally return STATUS_ACCESS_DENIED unless the driver
@@ -114,12 +114,14 @@
     <ClCompile Include="protected_registry_keys.c" />
     <ClCompile Include="process_lineage.c" />
     <ClCompile Include="raw_volume_gate.c" />
+    <ClCompile Include="tamper_unlock.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="protected_resources.h" />
     <ClInclude Include="protected_registry_keys.h" />
     <ClInclude Include="process_lineage.h" />
     <ClInclude Include="raw_volume_gate.h" />
+    <ClInclude Include="tamper_unlock.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- Not built/verified yet - the INF isn't used for this step's install

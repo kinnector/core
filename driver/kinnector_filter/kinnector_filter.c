@@ -161,11 +161,12 @@
 // distinguishing a raw-volume open from an ordinary file create at the
 // minifilter layer. This check runs before the existing per-file
 // FileInternalInformation query, which either doesn't apply to a raw-volume
-// open or isn't reliable for one - untested on this driver either way,
-// since this step wasn't run against a real \\.\C: handle on a live
-// machine (unlike steps 1-4, which each closed with an empirical
-// verification pass - see [[core_windows_phase7_progress]]). Flag this
-// explicitly rather than claim step 3's level of confidence.
+// open or isn't reliable for one. Empirically verified 2026-08-26 against a
+// real \\.\C: handle on this machine, both allow and deny paths - see
+// [[core_windows_phase7_step9_raw_volume_gate]], which also documents a
+// real safety finding from that test (enforcement briefly denied an
+// unidentified other process - the test scaffolding didn't capture its
+// identity, a confirmed real gap, not just a theoretical one).
 //
 // gRawVolumeEnforcementEnabled follows the exact same doctrine as
 // gRegistryEnforcementEnabled: defaults FALSE, only a test-only registry
@@ -174,11 +175,40 @@
 // never deny. A raw-volume open is only ever denied when enforcement is on,
 // the allowlist is non-empty, AND the requesting process's coarse image
 // name isn't in it.
+//
+// Phase 7 step 10 (this change): driver self-protection, tamper-protection
+// half only. The plan's other half - PPL (Protected Process Light) status -
+// is NOT attempted here: PPL is enforced by ntoskrnl verifying the driver
+// image's signature chains up to one of a small, Microsoft-controlled set
+// of signer EKUs (Antimalware, WinTcb, Windows, LSA, ...) at load/process-
+// creation time, not just "the loader trusts this binary." A testsigning-
+// mode local certificate structurally cannot satisfy that check - this is
+// the same class of external, non-engineering blocker as Phase 4's ELAM/
+// Antimalware-PPL certificate requirement (see
+// [[core_windows_phase4_etwti_blocked]] and
+// [[project_blocked_on_anthropic_cvp]]), not something more driver code can
+// work around. Stating this plainly per the plan's own instruction, rather
+// than silently shipping a driver that isn't actually PPL and implying
+// otherwise.
+//
+// What IS achievable without a real cert: resisting an ordinary unload
+// request (see KinnectorFilterUnload's own comment for the mechanism and
+// its explicit MANDATORY-unload exception) and restricting who can even
+// issue `sc stop`/`sc delete` against this driver's service in the first
+// place, via the service's own security descriptor (`sc sdset` - an
+// operational/install-time step, not driver code; see
+// driver/harden_service_acl.ps1 once added). Both are real resistance
+// against the common case (an unprivileged or standard-admin actor trying
+// to turn this driver off), not a claim of resisting a fully privileged
+// BYOVD/kernel-level attacker - the plan's own text is explicit that such
+// an attacker remains a residual risk this step does not close, and no
+// docs here should imply otherwise.
 #include <fltKernel.h>
 #include "protected_resources.h"
 #include "protected_registry_keys.h"
 #include "process_lineage.h"
 #include "raw_volume_gate.h"
+#include "tamper_unlock.h"
 
 // PsGetProcessImageFileName is a real, stable NTOSKRNL export used
 // throughout the driver ecosystem (including major AV/EDR products) for
@@ -314,6 +344,18 @@ BOOLEAN gRegistryEnforcementEnabled = FALSE;
 // file's step 9 scope note and raw_volume_gate.h for the full doctrine.
 // Defaults off; test-only registry seed only.
 BOOLEAN gRawVolumeEnforcementEnabled = FALSE;
+
+// Phase 7 step 10 (this change): tamper-protection against a plain
+// (non-mandatory) unload request - see KinnectorFilterUnload for the full
+// explanation. Same doctrine as every other blocking mechanism in this
+// driver: defaults off, only a test-only registry seed
+// (TestTamperProtectionEnabled) can flip it, so loading this driver never
+// itself starts refusing to unload. This is the one flag in this file where
+// "leave it on by accident" has a materially worse failure mode than the
+// others (a driver that won't come off via the normal path, rather than a
+// caller getting an unexpected ACCESS_DENIED) - never seed this TRUE by
+// default, and treat any live test of it with more caution than the rest.
+BOOLEAN gTamperProtectionEnabled = FALSE;
 
 // PLACEHOLDER - registry-callback altitudes are a separate Microsoft-managed
 // numbering space from minifilter altitudes (see core/driver/kinnector_filter/
@@ -683,6 +725,27 @@ KinnectorLoadTestConfiguration(
         }
     }
 
+    // Seventh optional seed, same \Parameters key: step 10's
+    // gTamperProtectionEnabled toggle - same pattern as
+    // TestRegistryEnforcementEnabled/TestRawVolumeEnforcementEnabled above.
+    // Deliberately never anything but a test-only, explicitly-opted-in seed
+    // - see gTamperProtectionEnabled's own declaration for why this one in
+    // particular must never be seeded TRUE by any real default path.
+    {
+        UCHAR enforceBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+        PKEY_VALUE_PARTIAL_INFORMATION enforceInfo = (PKEY_VALUE_PARTIAL_INFORMATION)enforceBuffer;
+        ULONG enforceValue = 0;
+
+        RtlInitUnicodeString(&valueName, L"TestTamperProtectionEnabled");
+        status = ZwQueryValueKey(keyHandle, &valueName, KeyValuePartialInformation, enforceInfo, sizeof(enforceBuffer), &resultLength);
+        if (NT_SUCCESS(status) && enforceInfo->Type == REG_DWORD && enforceInfo->DataLength == sizeof(ULONG)) {
+            RtlCopyMemory(&enforceValue, enforceInfo->Data, sizeof(ULONG));
+            if (enforceValue != 0) {
+                gTamperProtectionEnabled = TRUE;
+            }
+        }
+    }
+
     ZwClose(keyHandle);
 }
 
@@ -1013,8 +1076,43 @@ KinnectorFilterUnload(
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
     )
 {
-    UNREFERENCED_PARAMETER(Flags);
     PAGED_CODE();
+
+    // Step 10: tamper-protection against a plain unload request - `fltmc
+    // unload kinnector_filter` or the unload FltMgr triggers when the
+    // service is stopped (`sc stop`), without the FLTFL_FILTER_UNLOAD_
+    // MANDATORY flag set. Returning STATUS_FLT_DO_NOT_DETACH here is the
+    // Filter Manager's documented mechanism for a filter to refuse an
+    // unload it wasn't forced into - the exact pattern Microsoft's own
+    // MiniSpy sample uses for an "unload inhibited" flag.
+    //
+    // SAFETY-CRITICAL: never refuse a MANDATORY unload. FltMgr sets that
+    // flag for system shutdown and other cases where the unload has to
+    // happen regardless - refusing it anyway doesn't actually protect
+    // anything (mandatory unload proceeds either way per FltMgr's own
+    // contract) and risks turning an ordinary shutdown into a hang. This is
+    // real tamper resistance against the common case (an attacker or script
+    // running `sc stop`/`fltmc unload` without SYSTEM-level shutdown
+    // authority), not a claim of resisting every unload path - see this
+    // file's step 10 header note (once added) and WINDOWS_COVERAGE_PLAN.md
+    // step 10's own text for why a fully privileged BYOVD/kernel-level
+    // attacker remains a residual risk this does not close.
+    if (gTamperProtectionEnabled && !(Flags & FLTFL_FILTER_UNLOAD_MANDATORY)) {
+        // Password-gated escape hatch (see tamper_unlock.h for the full
+        // rationale and its own honest caveat about \Parameters not being
+        // ACL-hardened in this dev/test-scaffolding form) - without this,
+        // there would be no way to turn tamper-protection back off short of
+        // a real reboot, since only a real shutdown/forced dismount ever
+        // sets FLTFL_FILTER_UNLOAD_MANDATORY. gTestParametersPath is only
+        // ever non-empty when KinnectorLoadTestConfiguration successfully
+        // resolved it at DriverEntry; if it didn't, this check fails closed
+        // (ZwOpenKey on an empty path fails), same as every other error
+        // path in KinnectorCheckTamperUnlockPassword.
+        if (!KinnectorCheckTamperUnlockPassword(&gTestParametersPath)) {
+            return STATUS_FLT_DO_NOT_DETACH;
+        }
+        // Password matched - fall through and allow this specific unload.
+    }
 
     if (gProcessNotifyRegistered) {
         // Blocks until any in-flight callback invocations finish - safe and
