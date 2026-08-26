@@ -1,0 +1,1 @@
+See `CLAUDE.md` in this directory - that's the source of truth for agent-operational guidance in this repo (safety-critical warnings, BPF verifier gotchas, shared-hook conventions, build/test notes). This file is just a pointer for tools that look for `AGENTS.md` specifically.
