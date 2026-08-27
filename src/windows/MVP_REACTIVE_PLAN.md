@@ -396,11 +396,19 @@ profile — `test_reactive_e2e` / `test_file_guard` select it):
 | Kernel-Registry | CreateKey+OpenKey+SetValue | *unchanged* — see below |
 | TaskScheduler / DPAPI / ETW-TI | *unchanged* |
 
+**Schema cache — DONE 2026-08-27.** `s_schema` in `etw_consumer.cpp`: memoises
+`TRACE_EVENT_INFO` keyed on the full `EVENT_DESCRIPTOR` layout-affecting fields
+(provider GUID + Id + Version + Channel + Level + Opcode + Task — *not* Keyword).
+Non-manifest schemas (`DecodingSource != DecodingSourceXMLFile`) get an empty
+slot = "cold-parse forever". A 1/8192 canary re-parses a cached type and
+`memcmp`s; mismatch → log + evict. `ProcessEvent` no longer calls
+`TdhGetEventInformation` per event. **Measured: p50 dropped from ~1–3 s to
+~65–170 ms at ~100k events (this machine); hit rate 99.99%; the canary caught a
+real bug during dev — same (id,version) different Opcode sharing a slot — fixed
+by widening the key.** 14/14 ctest + `test_file_guard` 8/8. Stats logged at
+`Stop()`.
+
 **Still open, in priority order:**
-- **Schema cache.** `TdhGetEventInformation` (2 calls + alloc) runs per event.
-  Cache `TRACE_EVENT_INFO` by `(ProviderId, EventId, Version)` → the 91k Create
-  events get cheap regardless of count. This is now clearly the top fix — it
-  attacks the head of the distribution, which profile-trimming can't.
 - **Drop Registry OpenKey (id 2) from Reactive** — 36k events, #2 source. Held
   back because SetValueKey path resolution chains off the OpenKey/CreateKey
   BaseObject→KeyObject cache; dropping OpenKey may leave SetValue-on-a-

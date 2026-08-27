@@ -20,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -455,6 +456,122 @@ struct EventTypeCounts {
 };
 static EventTypeCounts s_type_counts;
 
+// Schema cache. `TdhGetEventInformation` (two calls + a heap allocation) runs
+// per event and is the dominant per-event cost - but for a manifest provider
+// the TRACE_EVENT_INFO blob is static per (provider, event id, version), so it
+// can be memoised. Non-manifest schemas (TraceLogging, WPP) are self-describing
+// and MUST be re-parsed every time - those get an empty slot meaning
+// "cold-parse forever". A ~1/8192 canary re-parses a cached type and compares,
+// to catch a provider whose schema somehow changed under us.
+// Key on everything in EVENT_DESCRIPTOR that can bind a different payload
+// template: Id, Version, Channel, Level, Opcode, Task. NOT Keyword (a bitmask,
+// doesn't affect layout). The canary caught same-(id,version)-different-opcode
+// events sharing a cache slot before Opcode/Task were included.
+struct SchemaKey {
+    GUID provider;
+    USHORT id;
+    USHORT task;
+    UCHAR version;
+    UCHAR channel;
+    UCHAR level;
+    UCHAR opcode;
+    bool operator==(const SchemaKey& o) const {
+        return id == o.id && version == o.version && task == o.task &&
+               channel == o.channel && level == o.level && opcode == o.opcode &&
+               IsEqualGUID(provider, o.provider);
+    }
+};
+struct SchemaKeyHash {
+    size_t operator()(const SchemaKey& k) const {
+        return (static_cast<size_t>(k.provider.Data1) << 24) ^
+               (static_cast<size_t>(k.id) << 12) ^
+               (static_cast<size_t>(k.task) << 6) ^
+               (static_cast<size_t>(k.opcode) << 3) ^ k.version ^
+               (static_cast<size_t>(k.channel) << 1) ^ k.level;
+    }
+};
+static SchemaKey MakeSchemaKey(PEVENT_RECORD e) {
+    const auto& d = e->EventHeader.EventDescriptor;
+    return SchemaKey{e->EventHeader.ProviderId, d.Id, d.Task,
+                     d.Version, d.Channel, d.Level, d.Opcode};
+}
+struct SchemaCache {
+    std::mutex m;
+    // value empty() => this (provider,id,version) is not cacheable, cold-parse.
+    std::unordered_map<SchemaKey, std::vector<BYTE>, SchemaKeyHash> map;
+    uint64_t hits = 0, misses = 0, canary_mismatch = 0;
+
+    // Returns a TRACE_EVENT_INFO for `event` (from the cache, or cold-parsed
+    // into `scratch`), or nullptr. `*was_cached` reports whether it was a hit.
+    PTRACE_EVENT_INFO Get(PEVENT_RECORD event, std::vector<BYTE>& scratch,
+                          bool* was_cached) {
+        *was_cached = false;
+        const SchemaKey key = MakeSchemaKey(event);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            auto it = map.find(key);
+            if (it != map.end() && !it->second.empty()) {
+                ++hits;
+                *was_cached = true;
+                return reinterpret_cast<PTRACE_EVENT_INFO>(it->second.data());
+            }
+            if (it != map.end()) {  // known non-cacheable
+                ++misses;
+            }
+        }
+
+        ULONG size = 0;
+        TdhGetEventInformation(event, 0, nullptr, nullptr, &size);
+        if (size == 0) return nullptr;
+        scratch.resize(size);
+        auto* info = reinterpret_cast<PTRACE_EVENT_INFO>(scratch.data());
+        if (TdhGetEventInformation(event, 0, nullptr, info, &size) != ERROR_SUCCESS)
+            return nullptr;
+
+        const bool cacheable = (info->DecodingSource == DecodingSourceXMLFile);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            ++misses;
+            auto& slot = map[key];
+            if (cacheable && slot.empty()) {
+                slot.assign(scratch.data(), scratch.data() + size);
+                return reinterpret_cast<PTRACE_EVENT_INFO>(slot.data());
+            }
+        }
+        return info;  // points into scratch, valid for this ProcessEvent call
+    }
+
+    // Called on a sampled cache hit: cold-parse and compare.
+    void Canary(PEVENT_RECORD event, PTRACE_EVENT_INFO cached) {
+        ULONG size = 0;
+        TdhGetEventInformation(event, 0, nullptr, nullptr, &size);
+        if (size == 0) return;
+        std::vector<BYTE> fresh(size);
+        if (TdhGetEventInformation(event, 0, nullptr,
+                reinterpret_cast<PTRACE_EVENT_INFO>(fresh.data()), &size) != ERROR_SUCCESS)
+            return;
+        if (memcmp(fresh.data(), cached, size) != 0) {
+            std::lock_guard<std::mutex> lk(m);
+            ++canary_mismatch;
+            std::cerr << "[ETW] schema-cache canary MISMATCH for provider "
+                      << std::hex << event->EventHeader.ProviderId.Data1 << std::dec
+                      << " id" << event->EventHeader.EventDescriptor.Id
+                      << " opcode" << (int)event->EventHeader.EventDescriptor.Opcode
+                      << " - evicting\n";
+            map.erase(MakeSchemaKey(event));
+        }
+    }
+
+    void Report() {
+        std::lock_guard<std::mutex> lk(m);
+        std::cout << "[ETW] schema cache: " << hits << " hits, " << misses
+                  << " misses, " << map.size() << " types";
+        if (canary_mismatch) std::cout << ", " << canary_mismatch << " CANARY MISMATCHES";
+        std::cout << "\n";
+    }
+};
+static SchemaCache s_schema;
+
 // Kernel-File Write/Read events carry a FileObject + IOSize but no path;
 // Rename/Delete carry FileObject too, though Rename/Delete also happen to
 // carry the acted-on path directly via their own "FilePath" property (see
@@ -804,18 +921,16 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
     s_type_counts.Bump(event->EventHeader.ProviderId,
                        event->EventHeader.EventDescriptor.Id);
 
-    // Use TDH to get schema info for property extraction
-    ULONG info_size = 0;
-    TdhGetEventInformation(event, 0, nullptr, nullptr, &info_size);
-    if (info_size == 0) return;
-
-    std::vector<BYTE> info_buf(info_size);
-    auto* info = reinterpret_cast<TRACE_EVENT_INFO*>(info_buf.data());
-    if (TdhGetEventInformation(event, 0, nullptr, info, &info_size)
-            != ERROR_SUCCESS) return;
+    // Schema info for property extraction - memoised per (provider, id, version).
+    thread_local std::vector<BYTE> info_scratch;
+    bool schema_cached = false;
+    auto* info = s_schema.Get(event, info_scratch, &schema_cached);
+    if (!info) return;
 
     TelemetryEvent out = {};
     out.header.sequence_number = ++s_sequence;
+    if (schema_cached && (s_sequence & 0x1FFF) == 0)
+        s_schema.Canary(event, info);
     out.header.timestamp_ns    = event->EventHeader.TimeStamp.QuadPart * 100ULL;
     out.header.pid             = event->EventHeader.ProcessId;
     out.header.source          = TelemetrySource::ETW;
@@ -1321,6 +1436,7 @@ void EtwConsumer::Stop() {
         session_handle_ = 0;
         s_latency.Report();
         s_type_counts.Report();
+        s_schema.Report();
     }
     if (thread_handle_) {
         WaitForSingleObject(thread_handle_, 5000);
