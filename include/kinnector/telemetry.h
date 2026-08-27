@@ -298,4 +298,11 @@ struct TelemetryEvent {
 
 #pragma pack(pop)
 
+// ABI lock. The Windows agent decodes TelemetryEvent straight off the named
+// pipe (src/windows/api-specs.md); there is no version field, so the on-wire
+// size must not drift silently. If either assert fires, the pipe ABI changed -
+// rebuild the agent's mirror struct and bump both sides together.
+static_assert(sizeof(TelemetryHeader) == 30, "TelemetryHeader ABI changed");
+static_assert(sizeof(TelemetryEvent) == 1590, "TelemetryEvent ABI changed");
+
 #endif // KINNECTOR_TELEMETRY_H

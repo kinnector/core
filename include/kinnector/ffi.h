@@ -208,6 +208,13 @@ KINNECTOR_API bool set_telemetry_profile_windows(uint32_t profile);
 KINNECTOR_API bool add_telemetry_path_filter_windows(const char* path);
 KINNECTOR_API bool clear_telemetry_path_filter_windows(void);
 
+// Windows-only: on-wire ABI check. The agent decodes TelemetryEvent straight
+// off the named pipe with no version field - call this at load time and assert
+// the values match the agent's own struct sizes before trusting the stream.
+// Any out-param may be NULL. See src/windows/api-specs.md.
+KINNECTOR_API bool telemetry_abi_windows(uint32_t* out_event_size,
+                                         uint32_t* out_header_size);
+
 // Windows-only (WS6): live sensor-health counters. Any out-param may be NULL.
 // events_lost > 0 means the ETW session dropped events (consumer fell behind).
 KINNECTOR_API bool get_telemetry_stats_windows(uint64_t* out_events_processed,

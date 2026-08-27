@@ -985,6 +985,17 @@ bool set_telemetry_profile_windows(uint32_t profile) {
     return false;
 }
 
+bool telemetry_abi_windows(uint32_t* out_event_size, uint32_t* out_header_size) {
+#if defined(TARGET_OS_WINDOWS)
+    if (out_event_size)  *out_event_size  = static_cast<uint32_t>(sizeof(TelemetryEvent));
+    if (out_header_size) *out_header_size = static_cast<uint32_t>(sizeof(TelemetryHeader));
+    return true;
+#else
+    (void)out_event_size; (void)out_header_size;
+    return false;
+#endif
+}
+
 bool add_telemetry_path_filter_windows(const char* path) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_WINDOWS)
