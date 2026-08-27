@@ -985,6 +985,55 @@ bool set_telemetry_profile_windows(uint32_t profile) {
     return false;
 }
 
+bool add_telemetry_path_filter_windows(const char* path) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_etw && path && path[0]) {
+        g_etw->AddEmitPathFilter(Utf8ToWstrFfi(path));
+        return true;
+    }
+#else
+    (void)path;
+#endif
+    return false;
+}
+
+bool clear_telemetry_path_filter_windows(void) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_etw) {
+        g_etw->ClearEmitPathFilters();
+        return true;
+    }
+#endif
+    return false;
+}
+
+bool get_telemetry_stats_windows(uint64_t* out_events_processed,
+                                 uint64_t* out_events_lost,
+                                 uint64_t* out_buffers_written,
+                                 double* out_p50_ms, double* out_p95_ms,
+                                 double* out_p99_ms, double* out_max_ms) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_etw && g_running) {
+        auto s = g_etw->GetStats();
+        if (out_events_processed) *out_events_processed = s.events_processed;
+        if (out_events_lost)      *out_events_lost = s.events_lost;
+        if (out_buffers_written)  *out_buffers_written = s.buffers_written;
+        if (out_p50_ms) *out_p50_ms = s.p50_ms;
+        if (out_p95_ms) *out_p95_ms = s.p95_ms;
+        if (out_p99_ms) *out_p99_ms = s.p99_ms;
+        if (out_max_ms) *out_max_ms = s.max_ms;
+        return true;
+    }
+#else
+    (void)out_events_processed; (void)out_events_lost; (void)out_buffers_written;
+    (void)out_p50_ms; (void)out_p95_ms; (void)out_p99_ms; (void)out_max_ms;
+#endif
+    return false;
+}
+
 bool add_file_guard_windows(const char* path) {
     std::lock_guard<std::mutex> lock(g_ffi_mutex);
 #if defined(TARGET_OS_WINDOWS)

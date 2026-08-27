@@ -197,6 +197,27 @@ KINNECTOR_API bool remove_file_guard_windows(const char* path);
 //                 should select this.
 KINNECTOR_API bool set_telemetry_profile_windows(uint32_t profile);
 
+// Windows-only (WS6): emit-path filter. When at least one path is registered,
+// file Create/Delete/Rename ETW events are forwarded to the consumer callback
+// ONLY when the file's basename (case-insensitive) matches a registered path.
+// A CREATE storm from a process launch then costs only schema-lookup + one
+// property read + a hashset miss - no full parse, no struct build, no IPC.
+// Process / network / task / DPAPI events are never filtered. Empty filter =
+// forward everything (default). The agent must register the paths behind its
+// protected-resource entries. Callable before or after start.
+KINNECTOR_API bool add_telemetry_path_filter_windows(const char* path);
+KINNECTOR_API bool clear_telemetry_path_filter_windows(void);
+
+// Windows-only (WS6): live sensor-health counters. Any out-param may be NULL.
+// events_lost > 0 means the ETW session dropped events (consumer fell behind).
+KINNECTOR_API bool get_telemetry_stats_windows(uint64_t* out_events_processed,
+                                               uint64_t* out_events_lost,
+                                               uint64_t* out_buffers_written,
+                                               double* out_p50_ms,
+                                               double* out_p95_ms,
+                                               double* out_p99_ms,
+                                               double* out_max_ms);
+
 // Windows-only: process-integrity flags for the self-update trust gate
 // (antitheft.md §3 - trust is a continuously-revocable property of a
 // specific running process instance, not a one-time open-time decision).

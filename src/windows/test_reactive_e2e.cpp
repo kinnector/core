@@ -145,6 +145,11 @@ int main() {
     CHECK(add_protected_resource_windows(vol, frn, 1), "add_protected_resource_windows");
     CHECK(add_resource_owner_signer_windows(vol, frn, "Some Unrelated Vendor LLC"),
           "add_resource_owner_signer_windows");
+    {
+        char np[512];
+        WideCharToMultiByte(CP_UTF8, 0, g_protected.c_str(), -1, np, sizeof(np), nullptr, nullptr);
+        add_telemetry_path_filter_windows(np);  // exercise the emit-path filter
+    }
 
     // ── unauthorized actor touches the protected file ──────────────────────
     DWORD pid = 0, tid = 0;

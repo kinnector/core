@@ -408,22 +408,39 @@ real bug during dev — same (id,version) different Opcode sharing a slot — fi
 by widening the key.** 14/14 ctest + `test_file_guard` 8/8. Stats logged at
 `Stop()`.
 
-**Still open, in priority order:**
-- **Drop Registry OpenKey (id 2) from Reactive** — 36k events, #2 source. Held
-  back because SetValueKey path resolution chains off the OpenKey/CreateKey
-  BaseObject→KeyObject cache; dropping OpenKey may leave SetValue-on-a-
-  pre-existing-key with an unresolved path (→ missed match). Needs a reactive
-  registry-protection test before this is safe.
-- **Drain thread** — callback does `O(copy)` + enqueue; parse+dispatch on
-  worker(s). Guarantees no `EventsLost`; only helps latency once the schema
-  cache has raised per-event μ.
-- Kernel-File Create path-prefilter in the consumer (match against the
-  protected-resource + FileObject-tracked set before `should_emit`) — only
-  worth it after the schema cache, since you still pay to receive+parse.
+**Kernel-Registry dropped from Reactive — DONE 2026-08-27.** It only ever did
+persistence-write detection, and driver-less that's observe-only + evadable +
+can't attribute the actor (`SetValueKey` carries no key path, only an opaque
+`KeyObject` needing the high-volume `OpenKey` stream to resolve). Deferred to a
+snapshot+diff persistence poller / the driver's `CmRegisterCallbackEx`.
+TaskScheduler ETW still covers task-based persistence *with* the actor.
 
-Accepted Reactive-profile gaps: file reads via a handle opened before the
-engine/rule existed; DNS-over-UDP destinations; live ImageLoad feed (module
-inventory is an on-alert scan per the WS8-style discussion).
+**Emit-path filter + burst resilience — DONE 2026-08-27.**
+`add_telemetry_path_filter_windows(path)` / `clear_...` +
+`EtwConsumer::AddEmitPathFilter`: when non-empty, file Create/Delete/Rename
+events are forwarded only when the basename (case-insensitive) matches. A
+filtered-out create costs schema-lookup + one property read + a hashset miss,
+then `return` - no full parse, no `TelemetryEvent` build, no IPC. Also:
+`GetZoneIdentifier` (an ADS open per event!) is now Full-profile-only.
+`get_telemetry_stats_windows(...)` exposes live EventsLost / latency
+percentiles for sensor-health monitoring. New `test_etw_burst`: 6-thread file
+storm + process batch → **~160k Kernel-File events absorbed with EventsLost=0,
+p99 ~300-670ms, schema hit rate 99.99%.** No drain thread needed - the filter
++ cache gave enough headroom. 15/15 ctest.
+
+**Still open (nice-to-have, not blocking — the cache + filter + registry-drop
+covered the resource-usage goal):**
+- **Persistence poller** — the lightweight replacement for the dropped
+  Kernel-Registry monitoring: snapshot the configured persistence keys every
+  few seconds, diff against a baseline, alert + optionally auto-revert. No
+  actor attribution (that needs the driver). Small, self-contained.
+- **Drain thread** — callback does `O(copy)` + enqueue, parse on worker(s).
+  Only relevant if a future workload defeats the filter+cache headroom; the
+  burst test says it doesn't today.
+
+Accepted Reactive-profile gaps: registry persistence-write *attribution*; file
+reads via a handle opened before the engine/rule existed; DNS-over-UDP
+destinations; live ImageLoad feed (module inventory is an on-alert scan).
 
 ---
 

@@ -272,6 +272,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     add_test(NAME test_file_guard COMMAND kinnector-test-file-guard)
     set_tests_properties(test_file_guard PROPERTIES SKIP_RETURN_CODE 127)
 
+    add_executable(kinnector-test-etw-burst src/windows/test_etw_burst.cpp)
+    target_link_libraries(kinnector-test-etw-burst PRIVATE kinnector-core-shared)
+    add_test(NAME test_etw_burst COMMAND kinnector-test-etw-burst)
+    set_tests_properties(test_etw_burst PROPERTIES SKIP_RETURN_CODE 127)
+
     add_executable(kinnector-test-dpapi-events src/windows/test_dpapi_events.cpp)
     target_link_libraries(kinnector-test-dpapi-events PRIVATE kinnector-core crypt32)
     add_test(NAME test_dpapi_events COMMAND kinnector-test-dpapi-events)

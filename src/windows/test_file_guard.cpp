@@ -164,6 +164,7 @@ int main() {
           "add_resource_owner_signer_windows");
 
     const std::string narrow_path = Narrow(g_protected);
+    add_telemetry_path_filter_windows(narrow_path.c_str());  // exercise the emit filter
     CHECK(add_file_guard_windows(narrow_path.c_str()), "add_file_guard_windows");
     CHECK(set_response_enforcement_windows(1), "armed response enforcement");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));  // oplock settles

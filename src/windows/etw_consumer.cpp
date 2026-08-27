@@ -20,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <cwctype>
 #include <mutex>
 #include <unordered_map>
 #include <winsock2.h>
@@ -397,6 +398,18 @@ struct LatencyStats {
         if (ns > max_ns) max_ns = ns;
         if (samples.size() < kCap) samples.push_back(ns);
         else { samples[next] = ns; next = (next + 1) % kCap; }
+    }
+
+    void Snapshot(uint64_t* out_count, double* p50, double* p95, double* p99, double* mx) {
+        std::lock_guard<std::mutex> lk(m);
+        *out_count = count;
+        *p50 = *p95 = *p99 = 0;
+        *mx = max_ns / 1e6;
+        if (samples.empty()) return;
+        std::vector<uint64_t> s = samples;
+        std::sort(s.begin(), s.end());
+        auto pct = [&](double p) { return s[static_cast<size_t>(p * (s.size() - 1))] / 1e6; };
+        *p50 = pct(0.50); *p95 = pct(0.95); *p99 = pct(0.99);
     }
 
     void Report() {
@@ -826,19 +839,29 @@ bool EtwConsumer::EnableProviders() {
     // the KeyObject->path correlation cache, + SetValueKey for the actual
     // write telemetry). Keyword values verified via `logman query providers`
     // (see WINDOWS_COVERAGE_PLAN.md Phase 3).
-    ENABLE_TRACE_PARAMETERS etp_reg = {};
-    etp_reg.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
-    status = EnableTraceEx2(
-        session_handle_,
-        &KernelRegistryGuid,
-        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-        TRACE_LEVEL_INFORMATION,
-        0x1000 |  // CreateKey
-        0x2000 |  // OpenKey
-        0x100,    // SetValueKey
-        0, 0, &etp_reg);
-    if (status != ERROR_SUCCESS) {
-        std::cerr << "[ETW] EnableTraceEx2 (Kernel-Registry) failed: " << status << "\n";
+    //
+    // Reactive: NOT enabled. Registry monitoring here only ever did persistence-
+    // write detection, and without a driver it's observe-only + evadable +
+    // can't reliably attribute the actor (SetValueKey carries no key path, just
+    // an opaque KeyObject that needs the high-volume OpenKey stream to resolve).
+    // Deferred to a lightweight snapshot+diff persistence poller / the driver's
+    // CmRegisterCallbackEx. TaskScheduler (below) still covers task-based
+    // persistence and does carry the actor. See MVP_REACTIVE_PLAN.md.
+    if (!reactive) {
+        ENABLE_TRACE_PARAMETERS etp_reg = {};
+        etp_reg.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+        status = EnableTraceEx2(
+            session_handle_,
+            &KernelRegistryGuid,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            TRACE_LEVEL_INFORMATION,
+            0x1000 |  // CreateKey
+            0x2000 |  // OpenKey
+            0x100,    // SetValueKey
+            0, 0, &etp_reg);
+        if (status != ERROR_SUCCESS) {
+            std::cerr << "[ETW] EnableTraceEx2 (Kernel-Registry) failed: " << status << "\n";
+        }
     }
 
     // Enable Microsoft-Windows-TaskScheduler's Operational channel keyword
@@ -1052,12 +1075,21 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
     else if (IsEqualGUID(event->EventHeader.ProviderId, KernelFileGuid)) {
 
         if (event_id == KERNEL_FILE_CREATE) {
-            out.header.event_type = EventType::FileCreate;
             auto file_path = TdhGetWStringProperty(event, info, L"FileName");
             std::string path_utf8 = WstrToUtf8(file_path);
+            // Emit-path filter: bail before the full parse / struct build / IPC
+            // send for files nobody registered. This is what keeps a CREATE
+            // storm (a process launch opening dozens of DLLs) cheap - the cost
+            // per uninteresting create is now just the schema lookup + one
+            // property read + a hashset miss.
+            if (!ShouldEmitFilePath(path_utf8)) return;
+            out.header.event_type = EventType::FileCreate;
             strncpy_s(out.details.file_create.file_path,
                       path_utf8.c_str(), _TRUNCATE);
-            out.details.file_create.zone_id = GetZoneIdentifier(path_utf8);
+            // GetZoneIdentifier opens an ADS per call - only worth it for the
+            // Full profile's MOTW telemetry, never on the reactive hot path.
+            out.details.file_create.zone_id =
+                (profile_ == Profile::Full) ? GetZoneIdentifier(path_utf8) : -1;
             bool file_object_found = false;
             uint64_t file_object = TdhGetULongLongProperty(
                 event, info, L"FileObject", &file_object_found);
@@ -1090,7 +1122,6 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
             should_emit = true;
 
         } else if (event_id == KERNEL_FILE_RENAME_PATH) {
-            out.header.event_type = EventType::FileRename;
             // FilePath on this event is the destination/new path (empirically
             // verified - see WINDOWS_COVERAGE_PLAN.md Phase 3); the source
             // path is resolved from the FileObject cache seeded at Create.
@@ -1098,6 +1129,10 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
             std::string dest_utf8 = WstrToUtf8(dest_path);
             uint64_t file_object = TdhGetULongLongProperty(event, info, L"FileObject");
             std::string src = LookupFileObjectPath(file_object);
+            if (!ShouldEmitFilePath(dest_utf8) &&
+                (src.empty() || !ShouldEmitFilePath(src)))
+                return;
+            out.header.event_type = EventType::FileRename;
             strncpy_s(out.details.file_rename.source_path,
                       src.c_str(), _TRUNCATE);
             strncpy_s(out.details.file_rename.destination_path,
@@ -1110,11 +1145,12 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
             should_emit = true;
 
         } else if (event_id == KERNEL_FILE_DELETE_PATH) {
-            out.header.event_type = EventType::FileDelete;
             // FilePath on this event is the deleted file's own full path
             // directly (empirically verified) - no FileObject cache needed.
             auto file_path = TdhGetWStringProperty(event, info, L"FilePath");
             std::string path_utf8 = WstrToUtf8(file_path);
+            if (!ShouldEmitFilePath(path_utf8)) return;
+            out.header.event_type = EventType::FileDelete;
             strncpy_s(out.details.file_delete.file_path,
                       path_utf8.c_str(), _TRUNCATE);
             should_emit = true;
@@ -1449,6 +1485,66 @@ void EtwConsumer::Stop() {
 
 void EtwConsumer::SetEventCallback(EventCallback cb) {
     callback_ = cb;
+}
+
+static std::wstring BasenameUpper(const std::string& utf8_path) {
+    // utf8 -> wide
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8_path.c_str(), -1, nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(static_cast<size_t>(n) - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8_path.c_str(), -1, w.data(), n);
+    size_t slash = w.find_last_of(L"\\/");
+    std::wstring base = (slash == std::wstring::npos) ? w : w.substr(slash + 1);
+    for (auto& c : base) c = towupper(c);
+    return base;
+}
+
+void EtwConsumer::AddEmitPathFilter(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    std::wstring base = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    for (auto& c : base) c = towupper(c);
+    if (base.empty()) return;
+    std::lock_guard<std::mutex> lk(emit_filter_mutex_);
+    emit_basenames_.insert(base);
+}
+
+void EtwConsumer::ClearEmitPathFilters() {
+    std::lock_guard<std::mutex> lk(emit_filter_mutex_);
+    emit_basenames_.clear();
+}
+
+bool EtwConsumer::ShouldEmitFilePath(const std::string& file_path) const {
+    {
+        std::lock_guard<std::mutex> lk(emit_filter_mutex_);
+        if (emit_basenames_.empty()) return true;  // no filter => forward all
+    }
+    const std::wstring base = BasenameUpper(file_path);
+    std::lock_guard<std::mutex> lk(emit_filter_mutex_);
+    return emit_basenames_.count(base) > 0;
+}
+
+EtwConsumer::Stats EtwConsumer::GetStats() const {
+    Stats s;
+    if (session_handle_) {
+        const ULONG props_size = sizeof(EVENT_TRACE_PROPERTIES) + 256 * sizeof(WCHAR);
+        std::vector<BYTE> buf(props_size, 0);
+        auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
+        props->Wnode.BufferSize = props_size;
+        props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        if (ControlTraceW(session_handle_, nullptr, props,
+                          EVENT_TRACE_CONTROL_QUERY) == ERROR_SUCCESS) {
+            s.events_lost = props->EventsLost;
+            s.buffers_written = props->BuffersWritten;
+        }
+    }
+    s_latency.Snapshot(&s.events_processed, &s.p50_ms, &s.p95_ms, &s.p99_ms, &s.max_ms);
+    {
+        std::lock_guard<std::mutex> lk(s_schema.m);
+        s.schema_hits = s_schema.hits;
+        s.schema_misses = s_schema.misses;
+        s.schema_canary_mismatch = s_schema.canary_mismatch;
+    }
+    return s;
 }
 
 } // namespace kinnector::windows
