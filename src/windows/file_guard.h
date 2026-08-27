@@ -140,6 +140,7 @@ private:
     // callback, just slower.
     bool StartCorrelationSession();
     void StopCorrelationSession();
+    void FlushCorrelationSession();   // EVENT_TRACE_CONTROL_FLUSH - deliver buffered events now
     static void WINAPI CorrelationCallback(PEVENT_RECORD event);
     static DWORD WINAPI CorrelationTraceThread(LPVOID param);
 

@@ -294,6 +294,12 @@ void FileGuard::HandleBreak(Guard& g) {
 
     const DWORD t0 = GetTickCount();
 
+    // Force-flush the correlation session NOW. The opener's Kernel-File CREATE
+    // event fired while it was blocked in NtCreateFile (i.e. before we got
+    // here), but a real-time session sits on a partially-full buffer until the
+    // 1 s flush timer. This makes ETW deliver it in a few ms.
+    FlushCorrelationSession();
+
     // The foreign opener is blocked in the kernel pending our Acknowledge().
     // Correlate it to a pid, decide, suspend if UNAUTHORIZED, THEN ack - so an
     // unauthorized opener resumes already suspended and never completes its
@@ -307,13 +313,27 @@ void FileGuard::HandleBreak(Guard& g) {
     const DWORD budget = vetted_recent ? kVettedCorrelationMs : kCorrelationBudgetMs;
 
     std::vector<uint32_t> candidates;
-    {
-        std::unique_lock<std::mutex> lk(corr_mutex_);
-        if (!g.device_path.empty()) {
+    if (!g.device_path.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(corr_mutex_);
             corr_want_ = g.device_path;
             corr_pids_.clear();
-            corr_cv_.wait_for(lk, std::chrono::milliseconds(budget),
+        }
+        // Flush-poll: the opener's CREATE event is emitted somewhere in the
+        // create path while it's blocked on our ack, but we can't know exactly
+        // when it lands in a buffer. Wait in ~80 ms slices and force a flush
+        // after each empty one, so we deliver it within a slice of it being
+        // written rather than waiting out the 1 s flush timer.
+        for (DWORD spent = 0; spent < budget; spent += 80) {
+            std::unique_lock<std::mutex> lk(corr_mutex_);
+            corr_cv_.wait_for(lk, std::chrono::milliseconds(80),
                               [&] { return !corr_pids_.empty() || !running_.load(); });
+            if (!corr_pids_.empty() || !running_.load()) break;
+            lk.unlock();
+            FlushCorrelationSession();
+        }
+        {
+            std::unique_lock<std::mutex> lk(corr_mutex_);
             if (!corr_pids_.empty() && running_.load())
                 corr_cv_.wait_for(lk, std::chrono::milliseconds(kCollectExtraMs),
                                   [&] { return !running_.load(); });
@@ -434,13 +454,16 @@ bool FileGuard::StartCorrelationSession() {
         p->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         p->Wnode.ClientContext = 2;  // system-time clock
         p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        p->FlushTimer = 1;
-        // CREATE turns out to be the single highest-volume kernel-file event
-        // (~90% of file events on a busy box), so this session is not as light
-        // as hoped - give it real headroom so it stays inside the hold budget.
-        p->BufferSize = 64;      // KB
-        p->MinimumBuffers = 16;
-        p->MaximumBuffers = 64;
+        p->FlushTimer = 1;  // seconds - the documented floor
+        // A real-time session only delivers a buffer when it fills OR the flush
+        // timer fires, so a partially-full buffer costs up to 1 s. We do not
+        // rely on either: HandleBreak force-flushes this session
+        // (EVENT_TRACE_CONTROL_FLUSH) the instant a break arrives, which
+        // delivers the opener's already-buffered CREATE event in a few ms.
+        // Buffers here just need to survive a create storm without dropping.
+        p->BufferSize = 16;      // KB
+        p->MinimumBuffers = 24;
+        p->MaximumBuffers = 96;
         p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         return p;
     };
@@ -483,6 +506,18 @@ bool FileGuard::StartCorrelationSession() {
         return false;
     }
     return true;
+}
+
+void FileGuard::FlushCorrelationSession() {
+    if (!corr_session_) return;
+    const ULONG name_len =
+        static_cast<ULONG>((wcslen(kCorrSessionName) + 1) * sizeof(WCHAR));
+    const ULONG props_size = sizeof(EVENT_TRACE_PROPERTIES) + name_len;
+    std::vector<BYTE> b(props_size, 0);
+    auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(b.data());
+    p->Wnode.BufferSize = props_size;
+    p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    ControlTraceW(corr_session_, nullptr, p, EVENT_TRACE_CONTROL_FLUSH);
 }
 
 void FileGuard::StopCorrelationSession() {

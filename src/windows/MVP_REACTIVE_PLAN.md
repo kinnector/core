@@ -550,6 +550,17 @@ uncorrelated breaks, which is what its own `ReadFile`s look like — are ack'd
 immediately without re-holding. Plus a back-off after a run of uncorrelated
 breaks so a hot file (AV rescan loop) isn't held for a full budget each time.
 
+**WS7 hold-latency pass (2026-08-27):** three changes cut the hold from
+~470–1390 ms to **~265–450 ms (suspend) / ~230–375 ms (authorized)**, 10/10:
+(1) `FlushCorrelationSession` — `HandleBreak` force-flushes the dedicated
+Kernel-File session (`EVENT_TRACE_CONTROL_FLUSH`) in ~80 ms poll slices instead
+of waiting out the 1 s `FlushTimer` on a partially-full buffer (the dominant
+cost on a quiet box); (2) the `QueryFullProcessImageNameW` early-init retry cut
+20×25 ms → 3×20 ms; (3) `warm_signer_cache_windows(path)` FFI so the agent
+pre-resolves owner-set binary signers → the first `CachedVerifyAuthenticode`
+in the hold is a cache hit, not a ~50–250 ms WinVerifyTrust. Correlation
+session buffers 64 KB→16 KB (the flush, not the size, is what matters now).
+
 **Verified on this machine 2026-08-27** (`test_file_guard`, elevated, full
 14/14 ctest green): unauthorized `cmd.exe` reader → correlated in ~400 ms,
 `suspend OK`, **sentinel file never written = 0 bytes read**; resume → read

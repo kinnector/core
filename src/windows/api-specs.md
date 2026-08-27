@@ -229,6 +229,12 @@ bool is_authorized_modifying_path_windows(uint32_t vol, uint64_t frn, const char
 // telemetry emit filter (see §3). Register one per protected file path.
 bool add_telemetry_path_filter_windows(const char* path_utf8);
 bool clear_telemetry_path_filter_windows(void);
+
+// pre-resolve a binary's Authenticode signer into core's cache, off the hot
+// path. Call once per owner-set binary at registration - it removes the
+// ~50-250 ms first-WinVerifyTrust from the first WS7 hold / evaluate_access
+// for that binary.
+bool warm_signer_cache_windows(const char* binary_path_utf8);
 ```
 
 `category` is an opaque `u32` the agent defines (e.g. ssh-key / wallet /
@@ -517,6 +523,10 @@ For each protected file in config:
 - [ ] `add_telemetry_path_filter_windows(win32_path)`
 - [ ] if flagship: `add_file_guard_windows(win32_path)`
 - [ ] keep the mapping `basename/frn → {win32_path, category, owner signers}` in the agent for the reactive loop
+
+And once, for each distinct owner-set binary path across all resources:
+
+- [ ] `warm_signer_cache_windows(binary_path)` — cuts the first-hold latency
 
 Then once: `set_response_enforcement_windows(1)` (or leave disarmed for a
 detect-only rollout).

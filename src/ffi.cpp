@@ -815,6 +815,14 @@ static int FileGuardEvalOne(uint32_t pid, uint32_t volume_serial, uint64_t frn) 
     wchar_t img[1024] = {};
     DWORD img_len = 1024;
     bool got_img = QueryFullProcessImageNameW(q, 0, img, &img_len) != 0;
+    // A process that is still in early init can briefly reject the query.
+    // Correlation already waited for its FileCreate event so this is rare;
+    // one short retry, kept minimal - this is on the WS7 hold latency budget.
+    for (int i = 0; i < 3 && !got_img; ++i) {
+        Sleep(20);
+        img_len = 1024;
+        got_img = QueryFullProcessImageNameW(q, 0, img, &img_len) != 0;
+    }
     FILETIME cr{}, ex{}, kt{}, ut{};
     bool got_ct = GetProcessTimes(q, &cr, &ex, &kt, &ut) != 0;
     CloseHandle(q);
@@ -1044,6 +1052,23 @@ bool telemetry_abi_windows(uint32_t* out_event_size, uint32_t* out_header_size) 
     (void)out_event_size; (void)out_header_size;
     return false;
 #endif
+}
+
+bool warm_signer_cache_windows(const char* path) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_etw && path && path[0]) {
+        // Enqueue an off-hot-path Authenticode verification so the first
+        // WS7 hold / evaluate_access for this binary is served from cache
+        // instead of paying WinVerifyTrust (+ catalog) inline. The agent
+        // should call this for every owner-set binary path at registration.
+        g_etw->GetProcessRegistry()->WarmSignerCache(Utf8ToWstrFfi(path));
+        return true;
+    }
+#else
+    (void)path;
+#endif
+    return false;
 }
 
 bool add_telemetry_path_filter_windows(const char* path) {

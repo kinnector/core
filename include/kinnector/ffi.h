@@ -208,6 +208,13 @@ KINNECTOR_API bool set_telemetry_profile_windows(uint32_t profile);
 KINNECTOR_API bool add_telemetry_path_filter_windows(const char* path);
 KINNECTOR_API bool clear_telemetry_path_filter_windows(void);
 
+// Windows-only: pre-resolve `path`'s Authenticode signer into core's shared
+// cache, off the hot path. Call once per owner-set binary at registration so
+// the first WS7 oplock hold / evaluate_access for that binary is served from
+// cache instead of paying WinVerifyTrust (+ the catalog search) inline - which
+// is ~50-250 ms and is otherwise the biggest single cost in the hold budget.
+KINNECTOR_API bool warm_signer_cache_windows(const char* path);
+
 // Windows-only: on-demand native-module audit for the "signed process carrying
 // an injected/sideloaded DLL" check (interim hardening layer 3 - see
 // src/windows/api-specs.md). Enumerates `pid`'s loaded modules and, for each,
