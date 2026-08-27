@@ -110,6 +110,7 @@ static std::unique_ptr<kinnector::lnx::FanotifyMonitor> g_fanotify = nullptr;
 #include "windows/response.h"
 #include "windows/file_guard.h"
 #include <windows.h>
+#include <psapi.h>
 static std::unique_ptr<kinnector::windows::EtwConsumer> g_etw = nullptr;
 static std::unique_ptr<kinnector::windows::DriverHelper> g_driver = nullptr;
 static std::unique_ptr<kinnector::windows::ClipboardHelper> g_clipboard = nullptr;
@@ -983,6 +984,55 @@ bool set_telemetry_profile_windows(uint32_t profile) {
     (void)profile;
 #endif
     return false;
+}
+
+int32_t list_process_modules_windows(uint32_t pid, char* out, size_t out_len) {
+    // Deliberately NOT under g_ffi_mutex: this is meant to be called on-alert
+    // from a worker and a first audit of a plugin-heavy process can run many
+    // WinVerifyTrust calls (tens to hundreds of ms). It touches no ffi global -
+    // CachedVerifyAuthenticodeSignature has its own internal locking.
+#if defined(TARGET_OS_WINDOWS)
+    if (!out || out_len == 0) return -1;
+    out[0] = '\0';
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return -1;
+
+    HMODULE mods[2048];
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(h, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
+        CloseHandle(h);
+        return -1;
+    }
+    const size_t total = needed / sizeof(HMODULE);
+    const size_t n = total < 2048 ? total : 2048;
+
+    size_t pos = 0;
+    for (size_t i = 0; i < n; ++i) {
+        wchar_t wpath[1024];
+        DWORD len = GetModuleFileNameExW(h, mods[i], wpath, 1024);
+        if (len == 0 || len >= 1024) continue;
+        std::wstring wp(wpath, len);
+
+        char signer[256] = {};
+        bool signed_ok = kinnector::windows::CachedVerifyAuthenticodeSignature(
+            wp, signer, sizeof(signer));
+
+        std::string line = WstrToUtf8Ffi(wp);
+        line += '\t';
+        if (signed_ok) line += signer;
+        line += '\n';
+        if (pos + line.size() + 1 > out_len) break;  // buffer full - stop cleanly
+        memcpy(out + pos, line.data(), line.size());
+        pos += line.size();
+    }
+    out[pos] = '\0';
+    CloseHandle(h);
+    return static_cast<int32_t>(total);
+#else
+    (void)pid; (void)out; (void)out_len;
+    return -1;
+#endif
 }
 
 bool telemetry_abi_windows(uint32_t* out_event_size, uint32_t* out_header_size) {

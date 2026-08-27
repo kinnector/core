@@ -334,7 +334,27 @@ bool get_telemetry_stats_windows(uint64_t* out_events_processed,
 Poll periodically. `events_lost > 0` means the ETW session dropped events —
 surface it as a degraded-sensor alert.
 
-### 4.8 Registry (present but DORMANT in the reactive profile)
+### 4.8 Native-module audit (interim hardening layer 3)
+
+```c
+int32_t list_process_modules_windows(uint32_t pid, char* out, size_t out_len);
+```
+
+Enumerates `pid`'s loaded modules; for each, resolves the backing file's
+Authenticode signer through core's shared cache (**with the WS3 catalog-signing
+fallback** — do not reimplement this in Rust, or every catalog-signed system
+DLL reads as unsigned). Writes `"<full_path>\t<signer>\n"` per module (signer
+empty = unsigned/untrusted/unresolved), truncates cleanly if `out` fills.
+Returns the total module count (may exceed what was written), or `-1`.
+
+Call from a worker — a first audit of a plugin-heavy process runs many
+`WinVerifyTrust` calls. Not serialised against the rest of the FFI.
+
+**Agent owns the policy:** which publishers are acceptable for this owner
+process, and the **carve-out** — for Electron / .NET / JVM / browser processes
+an unsigned-module finding is noise, fall back to owner-set + lineage only.
+
+### 4.9 Registry (present but DORMANT in the reactive profile)
 
 `add_protected_registry_key_windows`, `add_registry_key_owner_signer_windows`,
 `is_authorized_registry_signer_windows`, `evaluate_access_windows` with
@@ -344,7 +364,7 @@ so nothing feeds them live. Registry-persistence monitoring is the agent's job
 now (snapshot + diff the persistence keys). `TaskRegistered` events still cover
 scheduled-task persistence *with* the actor.
 
-### 4.9 Self-update / process-integrity gate — NO-OP TODAY
+### 4.10 Self-update / process-integrity gate — NO-OP TODAY
 
 `flag_process_injected_windows` / `clear_process_flag_windows` /
 `is_process_clear_windows` / `is_authorized_self_update_windows` — exported but
@@ -399,7 +419,65 @@ agent should still process the event (log, confirm, maybe terminate).
 
 ---
 
-## 6. What core does NOT do
+## 6. Interim hardening (agent-side policy)
+
+Three layers that raise the bar between the MVP owner-set check and the
+eventual driver. All the *policy* lives in the agent; core provides the
+mechanism.
+
+### Layer 1 — tight per-category owner sets
+
+Each protected resource's owner set (`add_resource_owner_signer_windows`)
+contains the **specific vendor subject** — `"AgileBits, Inc."`, `"Google LLC"`,
+`"Amazon.com Services LLC"` — **never `"Microsoft Windows"` broadly**. Then
+every LOLBin (`esentutl.exe`, `reg.exe`, `certutil.exe`, `powershell.exe` — all
+signed `"Microsoft Windows"`) is simply not on any allowlist. Microsoft
+*applications* sign as `"Microsoft Corporation"` — a different subject — so
+`msedge.exe` can be allowlisted for the Edge cookie DB without letting a single
+LOLBin in.
+
+*The one category that must include `"Microsoft Windows"`* is SSH keys (OpenSSH
+ships in Windows; `ssh.exe` is `"Microsoft Windows"`). For that category only,
+keep a small **file-copy-LOLBin image-name denylist** (`esentutl`, `certutil`,
+`extrac32`, `expand`, `makecab`, `findstr`, `print`, `replace`, `diantz`, `reg`)
+— ~10 entries, stable — and treat a match as unauthorised regardless of signer.
+
+Core support: complete. `category` in `add_protected_resource_windows` is an
+opaque `u32` core stores and never interprets — the category→signer-set mapping
+is entirely yours.
+
+### Layer 2 — lineage
+
+Any process descended from a script host (`wscript`, `cscript`, `powershell`,
+`mshta`, a macro-spawned `cmd`) touching a credential resource is unauthorised
+regardless of its own signature.
+
+Build the tree from `ProcessCreate` events (`child_pid`, `real_parent_pid`,
+`child_sequence_number`, `parent_sequence_number`), keyed on
+`(pid, sequence_number)`. **Stamp a persistent marker** when a process is first
+seen as (or descended from) a script host, and propagate it to every descendant
+at creation — do **not** re-walk `real_parent_pid` lazily at check time.
+
+Caveat: `real_parent_pid` is ETW's `ParentProcessID`, which is **spoofable**
+(`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`). Commodity malware doesn't bother; the
+unspoofable source (`CreatingThreadId`) needs the Phase 7 driver.
+
+### Layer 3 — native module-signer audit
+
+When a process passes the owner-set check, audit its loaded native modules via
+`list_process_modules_windows` (§4.8). Any module not signed by a publisher you
+trust for this owner process ⇒ treat the access as compromised (sideloaded DLL
+/ search-order hijack / `SetWindowsHookEx`).
+
+**Carve-out:** skip this entirely for Electron / .NET / JVM / browser processes
+— they load a mess of components and JIT into private memory; an unsigned-module
+finding there is noise. Detect the runtime from the module list itself
+(`coreclr.dll`, `clr.dll`, `jvm.dll`, `node.dll`, `*\Chrome*`, an Electron
+`resources\app.asar`) and fall back to owner-set + lineage for those.
+
+---
+
+## 7. What core does NOT do
 
 - Parse any config. The agent loads `protect-community/configs/antitheft/` and
   pushes entries via the setters above.
@@ -413,7 +491,7 @@ agent should still process the event (log, confirm, maybe terminate).
 
 ---
 
-## 7. ABI safety
+## 8. ABI safety
 
 The event struct is shared source with **no version field**. Rules:
 
@@ -429,7 +507,7 @@ The event struct is shared source with **no version field**. Rules:
    `ProcessCreateDetails`) is a breaking change — rebuild both sides together
    and update the `static_assert` numbers here and in `telemetry.h`.
 
-## 8. Config → registration checklist
+## 9. Config → registration checklist
 
 For each protected file in config:
 

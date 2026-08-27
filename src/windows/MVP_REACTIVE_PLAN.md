@@ -428,6 +428,23 @@ storm + process batch → **~160k Kernel-File events absorbed with EventsLost=0,
 p99 ~300-670ms, schema hit rate 99.99%.** No drain thread needed - the filter
 + cache gave enough headroom. 15/15 ctest.
 
+**Interim hardening (agent-side policy, core provides the mechanism) — see
+`api-specs.md` §6.** Three layers between the owner-set check and the driver:
+1. **Tight per-category owner sets** — specific vendor subjects, never
+   `"Microsoft Windows"` broadly. LOLBins (all `"Microsoft Windows"`-signed)
+   fall off every allowlist; Microsoft *apps* sign `"Microsoft Corporation"`,
+   a distinct subject. SSH-key category (needs `"Microsoft Windows"` for
+   `ssh.exe`) gets a small stable file-copy-LOLBin image-name denylist. Core:
+   complete, `category` is an opaque `u32`.
+2. **Lineage** — script-host-descended → unauthorised regardless of signature.
+   Core emits ProcessCreate w/ parent + sequence numbers; the tree + persistent
+   markers are agent-side. `real_parent_pid` is spoofable until the driver.
+3. **Native module-signer audit** — `list_process_modules_windows(pid, out,
+   len)` (DONE 2026-08-27): enumerates a process's modules + resolves each
+   signer via the shared cache + WS3 catalog fallback, `"<path>\t<signer>\n"`
+   per line. Agent owns the trust policy + the JIT/browser carve-out.
+   `test_module_audit` (self-audit, ntdll → "Microsoft Windows", no elevation).
+
 **Still open (nice-to-have, not blocking — the cache + filter + registry-drop
 covered the resource-usage goal):**
 - **Persistence poller** — the lightweight replacement for the dropped

@@ -208,6 +208,22 @@ KINNECTOR_API bool set_telemetry_profile_windows(uint32_t profile);
 KINNECTOR_API bool add_telemetry_path_filter_windows(const char* path);
 KINNECTOR_API bool clear_telemetry_path_filter_windows(void);
 
+// Windows-only: on-demand native-module audit for the "signed process carrying
+// an injected/sideloaded DLL" check (interim hardening layer 3 - see
+// src/windows/api-specs.md). Enumerates `pid`'s loaded modules and, for each,
+// resolves the backing file's Authenticode signer through core's shared signer
+// cache (incl. the WS3 catalog-signing fallback - without it every catalog-
+// signed system DLL reads as unsigned). Writes `<full_path>\t<signer>\n` per
+// module into `out` (signer empty = unsigned/untrusted/unresolved); truncates
+// cleanly if `out` fills. Returns the total module count (may exceed what was
+// written), or -1 (pid gone / PPL / access denied).
+//
+// The agent applies the trust policy: which publishers are acceptable for this
+// owner process, and the carve-out for JIT/plugin-heavy apps (Electron, .NET,
+// browsers) where an unsigned-module finding is not actionable. Call from a
+// worker - a first audit of a big process runs many WinVerifyTrust calls.
+KINNECTOR_API int32_t list_process_modules_windows(uint32_t pid, char* out, size_t out_len);
+
 // Windows-only: on-wire ABI check. The agent decodes TelemetryEvent straight
 // off the named pipe with no version field - call this at load time and assert
 // the values match the agent's own struct sizes before trusting the stream.

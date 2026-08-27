@@ -98,8 +98,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     # Link libraries for Windows ETW, IPC, and Authenticode verification
     # (wintrust/crypt32: WinVerifyTrust/CertGetNameStringA in etw_consumer.cpp)
-    target_link_libraries(kinnector-core PRIVATE advapi32 ole32 tdh wintrust crypt32)
-    target_link_libraries(kinnector-core-shared PRIVATE advapi32 ole32 tdh wintrust crypt32)
+    target_link_libraries(kinnector-core PRIVATE advapi32 ole32 tdh wintrust crypt32 psapi)
+    target_link_libraries(kinnector-core-shared PRIVATE advapi32 ole32 tdh wintrust crypt32 psapi)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     # Link frameworks for macOS
     target_link_libraries(kinnector-core PRIVATE
@@ -276,6 +276,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(kinnector-test-etw-burst PRIVATE kinnector-core-shared)
     add_test(NAME test_etw_burst COMMAND kinnector-test-etw-burst)
     set_tests_properties(test_etw_burst PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-module-audit src/windows/test_module_audit.cpp)
+    target_link_libraries(kinnector-test-module-audit PRIVATE kinnector-core-shared)
+    add_test(NAME test_module_audit COMMAND kinnector-test-module-audit)
 
     add_executable(kinnector-test-dpapi-events src/windows/test_dpapi_events.cpp)
     target_link_libraries(kinnector-test-dpapi-events PRIVATE kinnector-core crypt32)
