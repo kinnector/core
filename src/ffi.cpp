@@ -1,6 +1,12 @@
 #include "kinnector/ffi.h"
 #include "kinnector/ipc.h"
 
+#include <chrono>
+#include <functional>
+#include <string>
+#include <thread>
+#include <vector>
+
 #if defined(TARGET_OS_LINUX)
 #include "linux/ebpf_loader.h"
 #include "linux/fanotify.h"
@@ -100,12 +106,18 @@ static std::unique_ptr<kinnector::lnx::FanotifyMonitor> g_fanotify = nullptr;
 #include "windows/clipboard_helper.h"
 #include "windows/resource_identity.h"
 #include "windows/process_integrity.h"
+#include "windows/authenticode.h"
+#include "windows/response.h"
+#include "windows/file_guard.h"
 #include <windows.h>
 static std::unique_ptr<kinnector::windows::EtwConsumer> g_etw = nullptr;
 static std::unique_ptr<kinnector::windows::DriverHelper> g_driver = nullptr;
 static std::unique_ptr<kinnector::windows::ClipboardHelper> g_clipboard = nullptr;
 static std::unique_ptr<kinnector::windows::ProtectedResourceStore> g_resource_store = nullptr;
+static std::unique_ptr<kinnector::windows::ProtectedRegistryStore> g_registry_store = nullptr;
 static std::unique_ptr<kinnector::windows::ProcessIntegrityStore> g_process_integrity = nullptr;
+static std::unique_ptr<kinnector::windows::ResponseEngine> g_response = nullptr;
+static std::unique_ptr<kinnector::windows::FileGuard> g_file_guard = nullptr;
 #endif
 
 static std::mutex g_ffi_mutex;
@@ -122,6 +134,32 @@ static std::wstring Utf8ToWstrFfi(const char* utf8) {
     std::wstring result(static_cast<size_t>(n) - 1, L'\0');  // n includes the null terminator
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, result.data(), n);
     return result;
+}
+
+static std::string WstrToUtf8Ffi(const std::wstring& ws) {
+    if (ws.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string result(static_cast<size_t>(n) - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, result.data(), n, nullptr, nullptr);
+    return result;
+}
+
+// Copy a std::string into a caller buffer, always NUL-terminating (truncating
+// if needed). No-op if buf is null or cap is 0.
+static void CopyOutStr(const std::string& src, char* buf, size_t cap) {
+    if (!buf || cap == 0) return;
+    size_t n = src.size() < cap - 1 ? src.size() : cap - 1;
+    memcpy(buf, src.data(), n);
+    buf[n] = '\0';
+}
+
+// WS7: the FileGuard break-handler's verdict + response step. Defined lower in
+// this file (needs EvaluateActor); forward-declared here so
+// initialize_telemetry_engine can hand its address to the FileGuard.
+namespace {
+kinnector::windows::FileGuard::EnforceResult FileGuardEnforce(
+    const std::vector<uint32_t>& candidate_pids, uint32_t volume_serial, uint64_t frn);
 }
 #endif
 
@@ -182,7 +220,12 @@ bool initialize_telemetry_engine(const char* bpf_obj_path, const char* socket_pa
 
     // Pure in-memory map, no external dependency to fail against.
     g_resource_store = std::make_unique<kinnector::windows::ProtectedResourceStore>();
+    g_registry_store = std::make_unique<kinnector::windows::ProtectedRegistryStore>();
     g_process_integrity = std::make_unique<kinnector::windows::ProcessIntegrityStore>();
+    g_response = std::make_unique<kinnector::windows::ResponseEngine>();  // disarmed
+    // WS7: oplock hold. Suspension is still gated on g_response's enforcement
+    // flag (disarmed by default) - arming a guard only enables correlation.
+    g_file_guard = std::make_unique<kinnector::windows::FileGuard>(&FileGuardEnforce);
 #endif
 
     g_initialized = true;
@@ -239,12 +282,21 @@ bool start_telemetry_engine() {
         if (g_sender) {
             g_sender->SendEvent(event);
         }
+        // WS7: feed FileCreate events to the oplock-hold correlator.
+        if (g_file_guard && event.header.event_type == EventType::FileCreate) {
+            g_file_guard->NotifyFileCreate(event.details.file_create.file_path,
+                                           event.header.pid);
+        }
     });
-    
+
     if (!g_etw->Start()) {
         std::cerr << "[FFI] Failed to start ETW Consumer" << std::endl;
         g_sender->Stop();
         return false;
+    }
+
+    if (g_file_guard) {
+        g_file_guard->Start();
     }
     
     if (g_driver) {
@@ -285,6 +337,12 @@ void stop_telemetry_engine() {
         g_fanotify->Stop();
     }
 #elif defined(TARGET_OS_WINDOWS)
+    // WS7: stop the guard worker first, while g_etw / the process registry it
+    // reads through FileGuardEnforce are still alive. Stop() joins the worker,
+    // so no break handler touches those globals afterwards.
+    if (g_file_guard) {
+        g_file_guard->Stop();
+    }
     if (g_etw) {
         g_etw->Stop();
     }
@@ -571,6 +629,390 @@ bool is_authorized_modifying_path_windows(uint32_t volume_serial, uint64_t file_
         return g_resource_store->IsAuthorizedModifyingPath(volume_serial, file_reference_number,
                                                              Utf8ToWstrFfi(modifying_binary_path));
     }
+#endif
+    return false;
+}
+
+bool add_protected_registry_key_windows(const char* key_path, uint32_t category, uint8_t subtree) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_registry_store && g_running && key_path) {
+        return g_registry_store->AddProtectedKey(
+            kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(key_path)),
+            category, subtree != 0);
+    }
+#else
+    (void)key_path; (void)category; (void)subtree;
+#endif
+    return false;
+}
+
+bool remove_protected_registry_key_windows(const char* key_path) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_registry_store && g_running && key_path) {
+        return g_registry_store->RemoveProtectedKey(
+            kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(key_path)));
+    }
+#else
+    (void)key_path;
+#endif
+    return false;
+}
+
+bool is_protected_registry_key_windows(const char* key_path, uint32_t* out_category) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_registry_store && g_running && key_path) {
+        return g_registry_store->LookupProtectedKey(
+            kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(key_path)), out_category);
+    }
+#else
+    (void)key_path; (void)out_category;
+#endif
+    return false;
+}
+
+bool add_registry_key_owner_signer_windows(const char* key_path, const char* signer_subject) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_registry_store && g_running && key_path && signer_subject) {
+        return g_registry_store->AddOwnerSigner(
+            kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(key_path)), signer_subject);
+    }
+#else
+    (void)key_path; (void)signer_subject;
+#endif
+    return false;
+}
+
+bool remove_registry_key_owner_signer_windows(const char* key_path, const char* signer_subject) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_registry_store && g_running && key_path && signer_subject) {
+        return g_registry_store->RemoveOwnerSigner(
+            kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(key_path)), signer_subject);
+    }
+#else
+    (void)key_path; (void)signer_subject;
+#endif
+    return false;
+}
+
+bool is_authorized_registry_signer_windows(const char* key_path, const char* signer_subject) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_registry_store && g_running && key_path && signer_subject) {
+        return g_registry_store->IsAuthorizedSigner(
+            kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(key_path)), signer_subject);
+    }
+#else
+    (void)key_path; (void)signer_subject;
+#endif
+    return false;
+}
+
+bool resolve_actor_windows(uint32_t pid,
+                            uint64_t* out_sequence_number,
+                            uint64_t* out_create_time,
+                            char* out_image_path, size_t out_image_path_len,
+                            char* out_signer_subject, size_t out_signer_subject_len,
+                            uint8_t* out_signed) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_etw && g_running) {
+        kinnector::windows::ProcessRegistry::ActorInfo info;
+        if (g_etw->GetProcessRegistry()->Lookup(pid, &info)) {
+            if (out_sequence_number) *out_sequence_number = info.sequence_number;
+            if (out_create_time)     *out_create_time = info.create_time;
+            CopyOutStr(WstrToUtf8Ffi(info.image_path), out_image_path, out_image_path_len);
+            CopyOutStr(info.signer_subject, out_signer_subject, out_signer_subject_len);
+            if (out_signed) {
+                *out_signed = info.signer_state ==
+                                  kinnector::windows::ProcessRegistry::SignerState::Signed
+                                  ? 1 : 0;
+            }
+            return true;
+        }
+    }
+#else
+    (void)pid; (void)out_sequence_number; (void)out_create_time;
+    (void)out_image_path; (void)out_image_path_len;
+    (void)out_signer_subject; (void)out_signer_subject_len; (void)out_signed;
+#endif
+    return false;
+}
+
+#if defined(TARGET_OS_WINDOWS)
+// Shared by evaluate_access_windows: given a resolved actor, decide against a
+// signer allowlist. Returns one of the WS4 verdict codes. Caller holds
+// g_ffi_mutex. `check_signer` is the store's IsAuthorizedSigner bound to the
+// specific protected resource.
+} // extern "C"
+namespace {
+enum EvalVerdict { EV_NOT_PROTECTED = 0, EV_AUTHORIZED = 1, EV_UNAUTHORIZED = 2, EV_UNKNOWN_ACTOR = 3 };
+
+uint32_t EvaluateActor(uint32_t actor_pid,
+                       const std::function<bool(const std::string&)>& check_signer,
+                       std::string* reason) {
+    kinnector::windows::ProcessRegistry::ActorInfo ai;
+    if (!g_etw->GetProcessRegistry()->Lookup(actor_pid, &ai)) {
+        if (reason) *reason = "actor pid not tracked";
+        return EV_UNKNOWN_ACTOR;
+    }
+    // Signer verification is async; if it hasn't landed yet, resolve it now
+    // (this FFI is not on the ETW hot path).
+    if (ai.signer_state == kinnector::windows::ProcessRegistry::SignerState::Pending &&
+        !ai.image_path.empty()) {
+        char buf[256] = {};
+        bool ok = kinnector::windows::CachedVerifyAuthenticodeSignature(
+            ai.image_path, buf, sizeof(buf));
+        ai.signer_state = ok ? kinnector::windows::ProcessRegistry::SignerState::Signed
+                             : kinnector::windows::ProcessRegistry::SignerState::Unsigned;
+        ai.signer_subject = ok ? std::string(buf) : std::string();
+    }
+    if (ai.signer_state == kinnector::windows::ProcessRegistry::SignerState::Pending) {
+        if (reason) *reason = "actor signer unresolved";
+        return EV_UNKNOWN_ACTOR;
+    }
+    if (ai.signer_state == kinnector::windows::ProcessRegistry::SignerState::Signed &&
+        check_signer(ai.signer_subject)) {
+        if (reason) *reason = "actor signer in owner allowlist";
+        return EV_AUTHORIZED;
+    }
+    if (reason) {
+        *reason = ai.signer_state == kinnector::windows::ProcessRegistry::SignerState::Signed
+                      ? "actor signer not in owner allowlist"
+                      : "actor is unsigned";
+    }
+    return EV_UNAUTHORIZED;
+}
+
+// WS7: verdict + response for a correlated oplock break. Runs on the FileGuard
+// worker thread, NOT under g_ffi_mutex - taking it here would deadlock against
+// stop_telemetry_engine (which holds g_ffi_mutex while FileGuard::Stop() joins
+// this thread). Safe without it: FileGuard::Stop() runs before any of these
+// globals are reset, and they are never reassigned after init.
+//
+// The opener's identity is resolved SYNCHRONOUSLY here (OpenProcess +
+// QueryFullProcessImageNameW + GetProcessTimes + a cached Authenticode
+// check), NOT via the ProcessRegistry - under heavy ETW load that registry
+// lags seconds behind and a just-spawned stealer would not be in it. The
+// owner-set decision is identical to EvaluateActor's: signed AND signer in
+// the resource's owner set -> authorized; anything else -> UNAUTHORIZED.
+//
+// `candidate_pids` is every process that fired a create for the guarded file
+// around the break (the real opener plus, often, an AV real-time scan). We
+// evaluate each and act on the first actionable one - a protected/system
+// process (AV) simply fails the OpenProcess/query and is skipped. The per-pid
+// lines it logs are the audit trail of what touched a flagship credential file.
+
+// One candidate. -1 = keep looking, 0 = definitively authorized (stop), 1 = suspended.
+static int FileGuardEvalOne(uint32_t pid, uint32_t volume_serial, uint64_t frn) {
+    HANDLE q = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!q) return -1;  // protected/exited - not the actionable opener
+    wchar_t img[1024] = {};
+    DWORD img_len = 1024;
+    bool got_img = QueryFullProcessImageNameW(q, 0, img, &img_len) != 0;
+    FILETIME cr{}, ex{}, kt{}, ut{};
+    bool got_ct = GetProcessTimes(q, &cr, &ex, &kt, &ut) != 0;
+    CloseHandle(q);
+    if (!got_img || !got_ct || img_len == 0 || img_len >= 1024) return -1;
+
+    const uint64_t create_time =
+        (static_cast<uint64_t>(cr.dwHighDateTime) << 32) | cr.dwLowDateTime;
+    std::wstring image_path(img, img_len);
+
+    char signer[256] = {};
+    bool signed_ok = kinnector::windows::CachedVerifyAuthenticodeSignature(
+        image_path, signer, sizeof(signer));
+    std::cout << "[file_guard] pid " << pid << " image='" << WstrToUtf8Ffi(image_path)
+              << "' signed=" << signed_ok << " signer='" << signer << "'\n";
+
+    if (signed_ok &&
+        g_resource_store->IsAuthorizedSigner(volume_serial, frn, std::string(signer))) {
+        std::cout << "[file_guard] pid " << pid << " authorized (signer in owner set)\n";
+        return 0;
+    }
+
+    const char* why = signed_ok ? "signer not in owner set" : "unsigned/untrusted";
+    if (!g_response->EnforcementEnabled()) {
+        std::cout << "[file_guard] pid " << pid << " UNAUTHORIZED (" << why
+                  << ") but response disarmed - fail open\n";
+        return -1;
+    }
+    bool ok = g_etw && g_response->Suspend(pid, 0, create_time,
+                                           g_etw->GetProcessRegistry());
+    std::cout << "[file_guard] pid " << pid << " UNAUTHORIZED (" << why
+              << ") - suspend " << (ok ? "OK" : "FAILED") << "\n";
+    return ok ? 1 : -1;
+}
+
+kinnector::windows::FileGuard::EnforceResult FileGuardEnforce(
+    const std::vector<uint32_t>& candidate_pids, uint32_t volume_serial, uint64_t frn) {
+    using R = kinnector::windows::FileGuard::EnforceResult;
+    using V = kinnector::windows::FileGuard::Verdict;
+    if (!g_resource_store || !g_response) return R{};
+    if (!g_resource_store->LookupProtectedResource(volume_serial, frn, nullptr)) {
+        std::cout << "[file_guard] vol=" << volume_serial << " frn=" << frn
+                  << " not a registered protected resource - fail open\n";
+        return R{};
+    }
+    for (uint32_t pid : candidate_pids) {
+        int r = FileGuardEvalOne(pid, volume_serial, frn);
+        if (r == 1) return R{V::Suspended, pid};
+        if (r == 0) return R{V::Authorized, pid};
+    }
+    return R{};
+}
+} // namespace
+extern "C" {
+#endif
+
+bool evaluate_access_windows(uint32_t actor_pid, uint32_t target_kind,
+                              const char* target_id, uint32_t* out_verdict,
+                              char* out_reason, size_t out_reason_len) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (!g_running || !target_id || !g_etw) return false;
+    std::string reason;
+    uint32_t verdict = EV_NOT_PROTECTED;
+
+    if (target_kind == 1) {  // file path
+        auto id = kinnector::windows::ResolveCanonicalResourceIdentity(Utf8ToWstrFfi(target_id));
+        if (!id.valid) {
+            reason = "path did not resolve";
+        } else if (!g_resource_store ||
+                   !g_resource_store->LookupProtectedResource(id.volume_serial,
+                                                              id.file_reference_number, nullptr)) {
+            reason = "resource not protected";
+        } else {
+            verdict = EvaluateActor(actor_pid, [&](const std::string& s) {
+                return g_resource_store->IsAuthorizedSigner(id.volume_serial,
+                                                            id.file_reference_number, s);
+            }, &reason);
+        }
+    } else if (target_kind == 2) {  // registry key
+        std::wstring canon = kinnector::windows::CanonicalizeRegistryKey(Utf8ToWstrFfi(target_id));
+        if (!g_registry_store || !g_registry_store->LookupProtectedKey(canon, nullptr)) {
+            reason = "key not protected";
+        } else {
+            verdict = EvaluateActor(actor_pid, [&](const std::string& s) {
+                return g_registry_store->IsAuthorizedSigner(canon, s);
+            }, &reason);
+        }
+    } else {
+        reason = "unknown target_kind";
+    }
+
+    if (out_verdict) *out_verdict = verdict;
+    CopyOutStr(reason, out_reason, out_reason_len);
+    return true;
+#else
+    (void)actor_pid; (void)target_kind; (void)target_id;
+    (void)out_verdict; (void)out_reason; (void)out_reason_len;
+    return false;
+#endif
+}
+
+bool set_response_enforcement_windows(uint8_t enabled) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_response) {
+        g_response->SetEnforcementEnabled(enabled != 0);
+        return true;
+    }
+#else
+    (void)enabled;
+#endif
+    return false;
+}
+
+bool suspend_process_windows(uint32_t pid, uint64_t expected_sequence_number,
+                              uint64_t expected_create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_response && g_etw && g_running) {
+        return g_response->Suspend(pid, expected_sequence_number, expected_create_time,
+                                   g_etw->GetProcessRegistry());
+    }
+#else
+    (void)pid; (void)expected_sequence_number; (void)expected_create_time;
+#endif
+    return false;
+}
+
+bool resume_process_windows(uint32_t pid, uint64_t expected_sequence_number,
+                             uint64_t expected_create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_response && g_etw && g_running) {
+        return g_response->Resume(pid, expected_sequence_number, expected_create_time,
+                                  g_etw->GetProcessRegistry());
+    }
+#else
+    (void)pid; (void)expected_sequence_number; (void)expected_create_time;
+#endif
+    return false;
+}
+
+bool terminate_process_windows(uint32_t pid, uint64_t expected_sequence_number,
+                                uint64_t expected_create_time) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_response && g_etw && g_running) {
+        return g_response->Terminate(pid, expected_sequence_number, expected_create_time,
+                                     g_etw->GetProcessRegistry());
+    }
+#else
+    (void)pid; (void)expected_sequence_number; (void)expected_create_time;
+#endif
+    return false;
+}
+
+bool set_telemetry_profile_windows(uint32_t profile) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_etw && g_initialized && !g_running) {
+        g_etw->SetProfile(profile == 1
+                              ? kinnector::windows::EtwConsumer::Profile::Reactive
+                              : kinnector::windows::EtwConsumer::Profile::Full);
+        return true;
+    }
+#else
+    (void)profile;
+#endif
+    return false;
+}
+
+bool add_file_guard_windows(const char* path) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_file_guard && g_running && path && path[0]) {
+        std::wstring wpath = Utf8ToWstrFfi(path);
+        auto id = kinnector::windows::ResolveCanonicalResourceIdentity(wpath);
+        if (!id.valid || !g_resource_store ||
+            !g_resource_store->LookupProtectedResource(id.volume_serial,
+                                                       id.file_reference_number, nullptr)) {
+            std::cerr << "[file_guard] '" << path << "' is not a registered protected "
+                         "resource yet - guard armed but inert until it is\n";
+        }
+        return g_file_guard->AddGuard(wpath);
+    }
+#else
+    (void)path;
+#endif
+    return false;
+}
+
+bool remove_file_guard_windows(const char* path) {
+    std::lock_guard<std::mutex> lock(g_ffi_mutex);
+#if defined(TARGET_OS_WINDOWS)
+    if (g_file_guard && g_running && path && path[0]) {
+        return g_file_guard->RemoveGuard(Utf8ToWstrFfi(path));
+    }
+#else
+    (void)path;
 #endif
     return false;
 }

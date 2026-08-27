@@ -85,4 +85,58 @@ private:
     std::unordered_map<Key, std::unordered_set<std::string>, KeyHash> owner_signers_;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WS2 (MVP_REACTIVE_PLAN.md): protected registry keys.
+//
+// Registry has no File-Reference-Number equivalent - a key's identity is its
+// path. CanonicalizeRegistryKey normalises the many forms a path arrives in:
+//   \REGISTRY\MACHINE\...            native (ETW BaseObject chains, agent)
+//   HKLM\... | HKEY_LOCAL_MACHINE\...          -> \REGISTRY\MACHINE\...
+//   HKU\<SID>\... | HKEY_USERS\<SID>\...       -> \REGISTRY\USER\<SID>\...
+//   HKCU\... | HKEY_CURRENT_USER\...           -> \REGISTRY\USER\<caller SID>\...
+//   Software\...   (hive-relative, from an ETW chain that bottomed out)
+// ...to: uppercased, '/'->'\', duplicate '\' collapsed, no trailing '\'.
+//
+// HKCU is resolved against the CALLING process token, which for a SYSTEM
+// service is not the interactive user - the agent should register HKCU-scoped
+// keys as HKU\<explicit SID>\... instead.
+std::wstring CanonicalizeRegistryKey(const std::wstring& input);
+
+class ProtectedRegistryStore {
+public:
+    // subtree=true also protects keys/values below `canonical_key`.
+    bool AddProtectedKey(const std::wstring& canonical_key, uint32_t category, bool subtree);
+    bool RemoveProtectedKey(const std::wstring& canonical_key);
+
+    // `event_key` is canonicalised by the caller (or pass a raw form to the
+    // FFI wrapper, which canonicalises). Matches when a registered key K:
+    //   - equals event_key, or
+    //   - K.subtree and event_key is a descendant of K, or
+    //   - event_key ends with K on a path-component boundary - tolerates the
+    //     case where an ETW BaseObject chain could not be resolved all the way
+    //     to the hive root, so `event_key` is only hive-relative. For the
+    //     protection use case (persistence keys, per-app credential keys) a
+    //     hive-ambiguous match is a safe superset, not a false positive.
+    bool LookupProtectedKey(const std::wstring& event_key, uint32_t* out_category) const;
+
+    bool AddOwnerSigner(const std::wstring& canonical_key, const std::string& signer_subject);
+    bool RemoveOwnerSigner(const std::wstring& canonical_key, const std::string& signer_subject);
+    bool IsAuthorizedSigner(const std::wstring& event_key, const std::string& signer_subject) const;
+
+    size_t Count() const;
+
+private:
+    struct Entry {
+        uint32_t category = 0;
+        bool subtree = false;
+        std::unordered_set<std::string> owner_signers;
+    };
+    // Match `event_key` against the registered keys; returns the matching
+    // registered key (canonical) or empty. Caller holds mutex_.
+    std::wstring MatchLocked(const std::wstring& event_key) const;
+
+    mutable std::mutex mutex_;
+    std::unordered_map<std::wstring, Entry> keys_;
+};
+
 } // namespace kinnector::windows

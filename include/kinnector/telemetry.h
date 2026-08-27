@@ -56,6 +56,16 @@ struct TelemetryHeader {
     uint32_t pid;
     EventType event_type;
     TelemetrySource source;
+    // WS1 (src/windows/MVP_REACTIVE_PLAN.md): reuse-resistant identity of the
+    // process this event is attributed to (`pid` above). On Windows this is the
+    // Kernel-Process ProcessSequenceNumber resolved via ProcessRegistry; 0 means
+    // "unavailable" (process pre-dated the engine, or an older OS build) - never
+    // treat 0 as a real sequence value. Other platforms leave this 0 for now.
+    //
+    // ABI NOTE: appending this field shifts the offset of TelemetryEvent's
+    // `details` union. Any consumer that decodes this struct off the wire (the
+    // antitheft-agent named-pipe consumer) must be rebuilt against this header.
+    uint64_t actor_sequence_number;
 };
 
 // Sub-details structures corresponding to ALERT-SCHEMA.md types

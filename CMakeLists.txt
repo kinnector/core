@@ -39,6 +39,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
         src/windows/resource_identity.cpp
         src/windows/authenticode.cpp
         src/windows/process_integrity.cpp
+        src/windows/process_registry.cpp
+        src/windows/win_paths.cpp
+        src/windows/response.cpp
+        src/windows/file_guard.cpp
     )
     add_compile_definitions(TARGET_OS_WINDOWS)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -239,6 +243,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(kinnector-test-process-integrity PRIVATE kinnector-core)
     add_test(NAME test_process_integrity COMMAND kinnector-test-process-integrity)
     # No elevation needed - pure in-memory store, no real ETW/injection detection involved yet.
+
+    add_executable(kinnector-test-actor-identity src/windows/test_actor_identity.cpp)
+    target_link_libraries(kinnector-test-actor-identity PRIVATE kinnector-core)
+    add_test(NAME test_actor_identity COMMAND kinnector-test-actor-identity)
+    # Same elevation requirement/skip-not-mock pattern as test_process_lineage.
+    set_tests_properties(test_actor_identity PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-catalog-signing src/windows/test_catalog_signing.cpp)
+    target_link_libraries(kinnector-test-catalog-signing PRIVATE kinnector-core)
+    add_test(NAME test_catalog_signing COMMAND kinnector-test-catalog-signing)
+    # No elevation needed - pure Authenticode/catalog signature verification.
+
+    add_executable(kinnector-test-registry-protection src/windows/test_registry_protection.cpp)
+    target_link_libraries(kinnector-test-registry-protection PRIVATE kinnector-core)
+    add_test(NAME test_registry_protection COMMAND kinnector-test-registry-protection)
+    # Part 1 runs unprivileged; Part 2 needs elevation and self-skips (127).
+    set_tests_properties(test_registry_protection PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-reactive-e2e src/windows/test_reactive_e2e.cpp)
+    # Links the shared lib for the FFI surface, same as kinnector-runner.
+    target_link_libraries(kinnector-test-reactive-e2e PRIVATE kinnector-core-shared)
+    add_test(NAME test_reactive_e2e COMMAND kinnector-test-reactive-e2e)
+    set_tests_properties(test_reactive_e2e PROPERTIES SKIP_RETURN_CODE 127)
+
+    add_executable(kinnector-test-file-guard src/windows/test_file_guard.cpp)
+    target_link_libraries(kinnector-test-file-guard PRIVATE kinnector-core-shared)
+    add_test(NAME test_file_guard COMMAND kinnector-test-file-guard)
+    set_tests_properties(test_file_guard PROPERTIES SKIP_RETURN_CODE 127)
 
     add_executable(kinnector-test-dpapi-events src/windows/test_dpapi_events.cpp)
     target_link_libraries(kinnector-test-dpapi-events PRIVATE kinnector-core crypt32)

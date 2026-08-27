@@ -377,6 +377,84 @@ static std::string WstrToUtf8(const std::wstring& ws) {
 EtwConsumer* EtwConsumer::instance_ = nullptr;
 static ULONG s_sequence = 0;
 
+// WS6: event-origin -> ready-to-emit latency, so we can see whether the ETW
+// pipeline is fast enough for a suspend to land in time. Sampled on the emit
+// path; summarised at Stop().
+struct LatencyStats {
+    std::mutex m;
+    uint64_t count = 0;
+    uint64_t sum_ns = 0;
+    uint64_t max_ns = 0;
+    static constexpr size_t kCap = 4096;
+    std::vector<uint64_t> samples;
+    size_t next = 0;
+
+    void Record(uint64_t ns) {
+        std::lock_guard<std::mutex> lk(m);
+        ++count;
+        sum_ns += ns;
+        if (ns > max_ns) max_ns = ns;
+        if (samples.size() < kCap) samples.push_back(ns);
+        else { samples[next] = ns; next = (next + 1) % kCap; }
+    }
+
+    void Report() {
+        std::lock_guard<std::mutex> lk(m);
+        if (count == 0) {
+            std::cout << "[ETW] latency: no events sampled\n";
+            return;
+        }
+        std::vector<uint64_t> s = samples;
+        std::sort(s.begin(), s.end());
+        auto pct = [&](double p) {
+            return s[static_cast<size_t>(p * (s.size() - 1))];
+        };
+        std::cout << "[ETW] emit latency over " << count << " events (ms): "
+                  << "avg=" << (sum_ns / count) / 1e6
+                  << " p50=" << pct(0.50) / 1e6
+                  << " p95=" << pct(0.95) / 1e6
+                  << " p99=" << pct(0.99) / 1e6
+                  << " max=" << max_ns / 1e6 << "\n";
+    }
+};
+static LatencyStats s_latency;
+
+// Per-(provider, event-id) arrival counts, so a heavy session can be attributed
+// to specific event types (WS6 volume tuning). Keyed on the provider GUID's
+// Data1 (unique across the ~7 providers we enable) << 16 | event id.
+struct EventTypeCounts {
+    std::mutex m;
+    std::unordered_map<uint64_t, uint64_t> counts;
+    void Bump(const GUID& provider, USHORT id) {
+        std::lock_guard<std::mutex> lk(m);
+        counts[(static_cast<uint64_t>(provider.Data1) << 16) | id]++;
+    }
+    void Report() {
+        std::lock_guard<std::mutex> lk(m);
+        if (counts.empty()) return;
+        auto name = [](uint32_t d1) -> const char* {
+            switch (d1) {
+                case 0x22FB2CD6: return "Kernel-Process";
+                case 0xEDD08927: return "Kernel-File";
+                case 0x7DD42A49: return "Kernel-Network";
+                case 0x70EB4F03: return "Kernel-Registry";
+                case 0xDE7B24EA: return "TaskScheduler";
+                case 0x89FE8F40: return "Crypto-DPAPI";
+                case 0xF4E1897C: return "Threat-Intelligence";
+                default: return "?";
+            }
+        };
+        std::vector<std::pair<uint64_t, uint64_t>> v(counts.begin(), counts.end());
+        std::sort(v.begin(), v.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
+        std::cout << "[ETW] event volume by type:\n";
+        for (auto& [k, c] : v)
+            std::cout << "  " << name(static_cast<uint32_t>(k >> 16)) << "/id"
+                      << (k & 0xFFFF) << " : " << c << "\n";
+    }
+};
+static EventTypeCounts s_type_counts;
+
 // Kernel-File Write/Read events carry a FileObject + IOSize but no path;
 // Rename/Delete carry FileObject too, though Rename/Delete also happen to
 // carry the acted-on path directly via their own "FilePath" property (see
@@ -472,8 +550,17 @@ bool EtwConsumer::Initialize() {
 
     props->Wnode.BufferSize  = props_size;
     props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+    props->Wnode.ClientContext = 2; // system-time clock: EventHeader.TimeStamp
+                                    // is 100ns units since 1601 (WS6 latency).
     props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
     props->FlushTimer        = 1; // seconds
+    // WS6: the default handful of small buffers overflow under ImageLoad volume
+    // during an app-launch burst - measured EventsLost in the tens of thousands
+    // and p50 latency in seconds. A dropped event is a missed theft, so give
+    // the session more room: 64KB buffers, 32..128 of them (~8MB ceiling).
+    props->BufferSize        = 64;   // KB per buffer
+    props->MinimumBuffers    = 32;
+    props->MaximumBuffers    = 128;
     props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
 
     // Stop any stale session with the same name first. Explicit *W variant:
@@ -485,17 +572,56 @@ bool EtwConsumer::Initialize() {
     std::fill(props_buf.begin(), props_buf.end(), 0);
     props->Wnode.BufferSize  = props_size;
     props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+    props->Wnode.ClientContext = 2;
     props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
     props->FlushTimer        = 1;
+    props->BufferSize        = 64;
+    props->MinimumBuffers    = 32;
+    props->MaximumBuffers    = 128;
     props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
 
     ULONG status = StartTraceW(&session_handle_, SESSION_NAME, props);
+    // A previous instance (or a crashed one) can leave the session alive; the
+    // STOP above races its teardown. Retry a few times, re-stopping each round.
+    for (int attempt = 0; status == ERROR_ALREADY_EXISTS && attempt < 5; ++attempt) {
+        Sleep(300);
+        std::vector<BYTE> stop_buf(props_size, 0);
+        auto* stop_props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(stop_buf.data());
+        stop_props->Wnode.BufferSize = props_size;
+        stop_props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        ControlTraceW(0, SESSION_NAME, stop_props, EVENT_TRACE_CONTROL_STOP);
+        std::fill(props_buf.begin(), props_buf.end(), 0);
+        props->Wnode.BufferSize   = props_size;
+        props->Wnode.Flags        = WNODE_FLAG_TRACED_GUID;
+        props->Wnode.ClientContext = 2;
+        props->LogFileMode        = EVENT_TRACE_REAL_TIME_MODE;
+        props->FlushTimer         = 1;
+        props->BufferSize         = 64;
+        props->MinimumBuffers     = 32;
+        props->MaximumBuffers     = 128;
+        props->LoggerNameOffset   = sizeof(EVENT_TRACE_PROPERTIES);
+        status = StartTraceW(&session_handle_, SESSION_NAME, props);
+    }
+    if (status == ERROR_SUCCESS) {
+        std::cout << "[ETW] session buffers: size=" << props->BufferSize
+                  << "KB min=" << props->MinimumBuffers
+                  << " max=" << props->MaximumBuffers << "\n";
+    }
     if (status != ERROR_SUCCESS) {
         std::cerr << "[ETW] StartTrace failed: " << status << "\n";
         return false;
     }
+    return true;
+}
 
-    // Enable Microsoft-Windows-Kernel-Process (ProcessCreate + ImageLoad)
+bool EtwConsumer::EnableProviders() {
+    const bool reactive = (profile_ == Profile::Reactive);
+    ULONG status;
+
+    // Enable Microsoft-Windows-Kernel-Process. Full: process + image + thread.
+    // Reactive: process only (0x10) - ImageLoad is the biggest burst source and
+    // is not a verdict input (module inventory is collected on alert); thread
+    // events add nothing to the verdict and are spoofable without a driver.
     ENABLE_TRACE_PARAMETERS etp_proc = {};
     etp_proc.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
     status = EnableTraceEx2(
@@ -503,12 +629,8 @@ bool EtwConsumer::Initialize() {
         &KernelProcessGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
         TRACE_LEVEL_INFORMATION,
-        0x10 |  // WINEVENT_KEYWORD_PROCESS
-        0x20 |  // WINEVENT_KEYWORD_IMAGE
-        0x40,   // WINEVENT_KEYWORD_THREAD - not yet empirically confirmed on
-                // this machine like the two bits above are, see the
-                // KERNEL_THREAD_START comment; needed for cross-process
-                // thread-creation visibility (see ProcessEvent below).
+        reactive ? 0x10                    // PROCESS only
+                 : (0x10 | 0x20 | 0x40),   // PROCESS | IMAGE | THREAD
         0, 0, &etp_proc);
     if (status != ERROR_SUCCESS) {
         std::cerr << "[ETW] EnableTraceEx2 (Kernel-Process) failed: " << status << "\n";
@@ -521,6 +643,11 @@ bool EtwConsumer::Initialize() {
     // keyword; 0x10 is actually KERNEL_FILE_KEYWORD_FILENAME, and none of the
     // Read/Write/Delete/Rename events carry that bit in their own keyword
     // mask, so FileRead silently never fired under the old mask. Real bits:
+    // Reactive drops READ (0x100) + WRITE (0x200) - the highest-volume file
+    // events. Tier A triggers on CREATE; flagship-file reads are held by the
+    // WS7 oplock, not observed here. CREATE/DELETE/RENAME stay (an attacker
+    // deleting or replacing a protected file still matters, and they are low
+    // volume).
     ENABLE_TRACE_PARAMETERS etp_file = {};
     etp_file.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
     status = EnableTraceEx2(
@@ -528,11 +655,8 @@ bool EtwConsumer::Initialize() {
         &KernelFileGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
         TRACE_LEVEL_INFORMATION,
-        0x80  |  // KERNEL_FILE_KEYWORD_CREATE
-        0x100 |  // KERNEL_FILE_KEYWORD_READ
-        0x200 |  // KERNEL_FILE_KEYWORD_WRITE
-        0x400 |  // KERNEL_FILE_KEYWORD_DELETE_PATH
-        0x800,   // KERNEL_FILE_KEYWORD_RENAME_SETLINK_PATH
+        reactive ? (0x80 | 0x400 | 0x800)                    // CREATE|DELETE|RENAME
+                 : (0x80 | 0x100 | 0x200 | 0x400 | 0x800),   // +READ|WRITE
         0, 0, &etp_file);
     if (status != ERROR_SUCCESS) {
         std::cerr << "[ETW] EnableTraceEx2 (Kernel-File) failed: " << status << "\n";
@@ -546,8 +670,29 @@ bool EtwConsumer::Initialize() {
     // Accept/UDP-send event observed carried only IPV4(0x10) or IPV6(0x20),
     // so NetworkConnect telemetry had likely never actually fired either -
     // same bug class as the Kernel-File keyword fix above.
+    // Reactive keeps only TCP Connect (12) + Accept (15) via an in-kernel
+    // event-ID filter, dropping the per-datagram UdpIp/Send (42) flood. That
+    // still answers "did this process reach the network and where" without the
+    // volume. (DNS-over-UDP destinations are lost - accepted MVP gap.)
+    // EVENT_FILTER_EVENT_ID is variable-length: it declares Events[ANYSIZE_ARRAY]
+    // (== 1), so a 2-entry filter needs one extra USHORT of backing storage.
+    BYTE net_filter_buf[sizeof(EVENT_FILTER_EVENT_ID) + sizeof(USHORT)] = {};
+    auto* net_filter = reinterpret_cast<EVENT_FILTER_EVENT_ID*>(net_filter_buf);
+    net_filter->FilterIn = TRUE;
+    net_filter->Count = 2;
+    net_filter->Events[0] = KERNEL_NETWORK_TCP_CONNECT;
+    net_filter->Events[1] = KERNEL_NETWORK_TCP_ACCEPT;
+    EVENT_FILTER_DESCRIPTOR net_fd = {};
+    net_fd.Ptr = reinterpret_cast<ULONGLONG>(net_filter);
+    net_fd.Size = sizeof(net_filter_buf);
+    net_fd.Type = EVENT_FILTER_TYPE_EVENT_ID;
+
     ENABLE_TRACE_PARAMETERS etp_net = {};
     etp_net.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    if (reactive) {
+        etp_net.EnableFilterDesc = &net_fd;
+        etp_net.FilterDescCount = 1;
+    }
     status = EnableTraceEx2(
         session_handle_,
         &KernelNetworkGuid,
@@ -640,7 +785,8 @@ bool EtwConsumer::Initialize() {
                      "Antimalware-PPL - see WINDOWS_COVERAGE_PLAN.md Phase 4)\n";
     }
 
-    std::cout << "[ETW] Session started, providers enabled.\n";
+    std::cout << "[ETW] providers enabled ("
+              << (profile_ == Profile::Reactive ? "reactive" : "full") << " profile).\n";
     return true;
 }
 
@@ -653,6 +799,10 @@ void WINAPI EtwConsumer::EventRecordCallback(PEVENT_RECORD event) {
 
 void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
     if (!callback_) return;
+
+    // Attribute session volume to event types (free - no TDH needed).
+    s_type_counts.Bump(event->EventHeader.ProviderId,
+                       event->EventHeader.EventDescriptor.Id);
 
     // Use TDH to get schema info for property extraction
     ULONG info_size = 0;
@@ -712,6 +862,15 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
             out.details.process_create.real_parent_pid = parent_pid;
             out.details.process_create.child_sequence_number  = child_seq;
             out.details.process_create.parent_sequence_number = parent_seq;
+
+            // WS1: register the new process's reuse-safe identity. The event's
+            // own timestamp (100ns units since 1601, same basis as
+            // GetProcessTimes' creation FILETIME) stands in for the creation
+            // time - this event fires at process creation.
+            process_registry_.OnProcessStart(
+                child_pid, child_seq,
+                static_cast<uint64_t>(event->EventHeader.TimeStamp.QuadPart),
+                image_path);
             should_emit = true;
 
         } else if (event_id == KERNEL_THREAD_START) {
@@ -742,6 +901,11 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
             out.header.event_type = EventType::ProcessStop;
             auto exit_code = TdhGetULongProperty(event, info, L"ExitCode");
             out.details.process_stop.exit_code = static_cast<int32_t>(exit_code);
+            // WS1: drop the stopped process from the identity map. Prefer the
+            // event's own ProcessID property; fall back to the header.
+            uint32_t stopped_pid = TdhGetULongProperty(event, info, L"ProcessID");
+            if (stopped_pid == 0) stopped_pid = event->EventHeader.ProcessId;
+            process_registry_.OnProcessStop(stopped_pid);
             should_emit = true;
 
         } else if (event_id == KERNEL_IMAGE_LOAD) {
@@ -750,12 +914,21 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
             std::string path_utf8 = WstrToUtf8(image_path);
             strncpy_s(out.details.image_load.module_path,
                       path_utf8.c_str(), _TRUNCATE);
-            // Fix 4: real Authenticode verification
-            out.details.image_load.is_signed = static_cast<uint8_t>(
-                VerifyAuthenticodeSignature(
-                    image_path,
-                    out.details.image_load.signer_subject,
-                    sizeof(out.details.image_load.signer_subject)));
+            // WS6: signer verification is a WinVerifyTrust + a file open, far
+            // too slow for the ETW callback thread under ImageLoad volume
+            // (measured p50 latency in seconds). Peek the process-wide cache
+            // with zero I/O; on a miss, emit "unknown" and schedule an async
+            // warm so the next load of this module is served from cache.
+            bool sig = false;
+            if (PeekSignerCache(image_path, &sig,
+                                out.details.image_load.signer_subject,
+                                sizeof(out.details.image_load.signer_subject))) {
+                out.details.image_load.is_signed = static_cast<uint8_t>(sig);
+            } else {
+                out.details.image_load.is_signed = 0;
+                out.details.image_load.signer_subject[0] = '\0';
+                process_registry_.WarmSignerCache(image_path);
+            }
             should_emit = true;
         }
     }
@@ -881,16 +1054,33 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
     else if (IsEqualGUID(event->EventHeader.ProviderId, KernelRegistryGuid)) {
 
         if (event_id == KERNEL_REGISTRY_CREATE_KEY || event_id == KERNEL_REGISTRY_OPEN_KEY) {
-            // Not emitted as their own telemetry event (no CreateKey/OpenKey
-            // EventType exists in telemetry.h today - see Phase 3 notes on
-            // what's still open) - only used to seed the KeyObject->path
-            // cache that SetValueKey below depends on for its key_path.
+            // Not emitted as their own telemetry event - used to seed the
+            // KeyObject->path cache that SetValueKey below depends on.
+            //
+            // Kernel-Registry's RelativeName is relative to BaseObject (the
+            // parent key), so build the fullest path we can by chaining:
+            // <BaseObject's cached path> + "\" + RelativeName. When the chain
+            // bottoms out at an unknown BaseObject the path stays
+            // hive-relative; ProtectedRegistryStore's matching tolerates that.
             auto rel_name = TdhGetWStringProperty(event, info, L"RelativeName");
-            std::string path_utf8 = WstrToUtf8(rel_name);
+            std::string rel_utf8 = WstrToUtf8(rel_name);
+            uint64_t base_object = TdhGetULongLongProperty(event, info, L"BaseObject");
+            std::string base_path = LookupKeyObjectPath(base_object);
+
+            std::string full_path;
+            if (!base_path.empty()) {
+                full_path = base_path + "\\" + rel_utf8;
+            } else if (rel_utf8.rfind("\\REGISTRY", 0) == 0 ||
+                       rel_utf8.rfind("\\Registry", 0) == 0) {
+                full_path = rel_utf8;  // already absolute (root open)
+            } else {
+                full_path = rel_utf8;  // hive-relative
+            }
+
             bool key_object_found = false;
             uint64_t key_object = TdhGetULongLongProperty(
                 event, info, L"KeyObject", &key_object_found);
-            if (key_object_found) CacheKeyObjectPath(key_object, path_utf8);
+            if (key_object_found) CacheKeyObjectPath(key_object, full_path);
 
         } else if (event_id == KERNEL_REGISTRY_SET_VALUE) {
             out.header.event_type = EventType::RegistryWrite;
@@ -1042,6 +1232,23 @@ void EtwConsumer::ProcessEvent(PEVENT_RECORD event) {
     }
 
     if (should_emit) {
+        // WS1: stamp the reuse-safe identity of the attributed process. For
+        // DpapiOperation, out.header.pid was already overridden to the real
+        // caller above, so this resolves the caller's sequence number, not
+        // lsass.exe's.
+        out.header.actor_sequence_number =
+            process_registry_.SequenceNumberFor(out.header.pid);
+
+        // WS6: sample event-origin -> emit latency. Session clock is system
+        // time (ClientContext=2), so TimeStamp is 100ns units since 1601,
+        // directly comparable to GetSystemTimeAsFileTime.
+        FILETIME now_ft;
+        GetSystemTimeAsFileTime(&now_ft);
+        uint64_t now = (static_cast<uint64_t>(now_ft.dwHighDateTime) << 32) |
+                       now_ft.dwLowDateTime;
+        uint64_t origin = static_cast<uint64_t>(event->EventHeader.TimeStamp.QuadPart);
+        if (now > origin) s_latency.Record((now - origin) * 100ULL);
+
         callback_(out);
     }
 }
@@ -1075,9 +1282,19 @@ static DWORD WINAPI TraceThread(LPVOID param) {
 
 bool EtwConsumer::Start() {
     running_ = true;
+    // Enable providers now (not in Initialize) so SetProfile() had a chance to
+    // run in between. The session from Initialize() is already up.
+    if (!EnableProviders()) {
+        running_ = false;
+        return false;
+    }
+    // WS1: bring the identity map up before events start flowing - starts the
+    // signer-verification worker and enumerates already-running processes.
+    process_registry_.Start();
     thread_handle_ = CreateThread(NULL, 0, TraceThread, this, 0, NULL);
     if (!thread_handle_) {
         std::cerr << "[ETW] CreateThread failed: " << GetLastError() << "\n";
+        process_registry_.Stop();
         return false;
     }
     return true;
@@ -1092,15 +1309,26 @@ void EtwConsumer::Stop() {
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
         props->Wnode.BufferSize = props_size;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        // WS6: query dropped-event counters before tearing the session down.
+        if (ControlTraceW(session_handle_, nullptr, props,
+                          EVENT_TRACE_CONTROL_QUERY) == ERROR_SUCCESS) {
+            std::cout << "[ETW] session stats: EventsLost=" << props->EventsLost
+                      << " RealTimeBuffersLost=" << props->RealTimeBuffersLost
+                      << " BuffersWritten=" << props->BuffersWritten << "\n";
+        }
         ControlTraceW(session_handle_, nullptr, props,
                       EVENT_TRACE_CONTROL_STOP);
         session_handle_ = 0;
+        s_latency.Report();
+        s_type_counts.Report();
     }
     if (thread_handle_) {
         WaitForSingleObject(thread_handle_, 5000);
         CloseHandle(thread_handle_);
         thread_handle_ = NULL;
     }
+    // WS1: no more events can arrive now - tear down the identity worker.
+    process_registry_.Stop();
 }
 
 void EtwConsumer::SetEventCallback(EventCallback cb) {

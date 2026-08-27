@@ -60,10 +60,28 @@ int main() {
           "this is the actual point of the combined gate over a signer-only check");
     integrity.ClearProcessFlag(pid, create_time);
 
-    // Unsigned binary must fail even when the process is clear.
-    const std::wstring unsigned_stand_in = L"C:\\Windows\\System32\\notepad.exe";  // catalog-signed, not embedded - see authenticode.h
-    CHECK(!IsAuthorizedSelfUpdate(resources, integrity, volume_serial, frn, unsigned_stand_in, pid, create_time),
-          "unsigned (from this check's perspective) binary is NOT authorized even though the process is clear");
+    // A genuinely unsigned binary must fail even when the process is clear.
+    // (Before WS3's catalog-signing fallback this used notepad.exe as a
+    // stand-in - that now verifies via catalog, so use a real unsigned file.)
+    wchar_t temp_dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp_dir);
+    const std::wstring unsigned_file =
+        std::wstring(temp_dir) + L"kinnector_pi_unsigned_" +
+        std::to_wstring(GetCurrentProcessId()) + L".bin";
+    {
+        HANDLE h = CreateFileW(unsigned_file.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE, "created a temp unsigned file");
+        const char bytes[] = "not a signed binary";
+        DWORD wrote = 0;
+        WriteFile(h, bytes, sizeof(bytes), &wrote, nullptr);
+        CloseHandle(h);
+    }
+    CHECK(!GetAuthenticodeSigner(unsigned_file).has_value(),
+          "the temp file is genuinely unsigned (neither embedded nor catalog)");
+    CHECK(!IsAuthorizedSelfUpdate(resources, integrity, volume_serial, frn, unsigned_file, pid, create_time),
+          "an unsigned binary is NOT authorized even though the process is clear");
+    DeleteFileW(unsigned_file.c_str());
 
     std::cout << "\n>>> TEST SUCCESSFUL! Process integrity store and combined self-update gate validated. <<<" << std::endl;
     return 0;
