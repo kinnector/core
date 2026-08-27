@@ -292,3 +292,20 @@ sudo ./build/bin/kinnector-test-enforcement-e2e
 ## Who this is for
 
 If you're building an EDR agent, a runtime application self-protection (RASP) layer, a container-aware intrusion detection system, or any tool that needs kernel-level process/file/network visibility on Linux, Windows, or macOS - kinnector Core gives you the collection layer so you can focus on detection logic instead of eBPF loader plumbing, LSM hook wiring, or ETW session management.
+
+## License
+
+kinnector Core is **source-available, not open source**. It is licensed under the
+[PolyForm Noncommercial License 1.0.0](./LICENSE.md).
+
+You may use, copy, modify, fork, and redistribute it for any **noncommercial**
+purpose. Personal projects, research, education, evaluation, and use by
+nonprofit, educational, public-safety, and government organizations all qualify
+as noncommercial under that license.
+
+**Any commercial use requires a separate license.** If you want to use kinnector
+Core in or as part of a commercial product or service, email
+<license@kinnector.dev> to arrange commercial terms.
+
+Contributions are welcome under the [Contributor License Agreement](./CLA.md) —
+see [CONTRIBUTING.md](./CONTRIBUTING.md).
